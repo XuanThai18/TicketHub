@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="NSubstitute" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\TicketHub.Application\TicketHub.Application.csproj" />
+    <ProjectReference Include="..\..\src\TicketHub.Domain\TicketHub.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

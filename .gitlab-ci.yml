@@ -1,0 +1,83 @@
+# GitLab CI tương đương .github/workflows/ci.yml — giữ file của nền tảng bạn dùng, xoá file còn lại.
+stages:
+  - build
+  - test
+  - package
+  - migrate
+  # - deploy   # thêm job deploy ở stage này: chỉ chạy sau khi migrate xong
+
+variables:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget/packages"
+
+default:
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  cache:
+    key:
+      files: [Directory.Packages.props]
+    paths: [.nuget/packages]
+
+build:
+  stage: build
+  script:
+    - dotnet restore TicketHub.slnx
+    - dotnet build TicketHub.slnx -c Release --no-restore
+    - dotnet list TicketHub.slnx package --vulnerable --include-transitive | tee vuln.txt
+    - if grep -qE "Critical|High" vuln.txt; then echo "High/Critical vulnerable packages found"; exit 1; fi
+
+# Testcontainers cần Docker: dùng dịch vụ docker:dind (runner phải bật privileged).
+test:
+  stage: test
+  services:
+    - name: docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    TESTCONTAINERS_HOST_OVERRIDE: "docker"
+  script:
+    - dotnet test --solution TicketHub.slnx -c Release --report-xunit-trx --results-directory TestResults
+  artifacts:
+    when: always
+    paths: [TestResults]
+    expire_in: 7 days
+
+docker-image:
+  stage: package
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    # Đẩy lên registry (GitLab/Harbor): bỏ comment và cấu hình biến CI_REGISTRY_* tương ứng.
+    # - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"
+
+# Chạy migration lên DB production MỘT lần, TRƯỚC khi deploy bản app mới; bấm tay để chạy.
+# Bật bằng: Settings → CI/CD → Variables
+#   - RUN_DB_MIGRATIONS = true
+#   - PRODUCTION_DB_CONNECTION (Masked + Protected): tài khoản có quyền sửa cấu trúc bảng;
+#     app chạy bằng tài khoản khác chỉ đọc/ghi dữ liệu.
+migrate:
+  stage: migrate
+  environment: production
+  script:
+    - test -n "$PRODUCTION_DB_CONNECTION" || { echo "Variable PRODUCTION_DB_CONNECTION is not set"; exit 1; }
+    - dotnet tool restore
+    - dotnet ef migrations bundle --context ApplicationDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure --self-contained -r linux-x64 --force -o efbundle-app
+    - ./efbundle-app --connection "$PRODUCTION_DB_CONNECTION"
+    - dotnet ef migrations bundle --context AuthDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure --self-contained -r linux-x64 --force -o efbundle-auth
+    - ./efbundle-auth --connection "$PRODUCTION_DB_CONNECTION"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $RUN_DB_MIGRATIONS == "true"
+      when: manual
+      allow_failure: false   # pipeline dừng chờ bấm, không tự bỏ qua bước migration

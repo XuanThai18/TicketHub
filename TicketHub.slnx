@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TicketHub.Api/TicketHub.Api.csproj" />
+    <Project Path="src/TicketHub.Application/TicketHub.Application.csproj" />
+    <Project Path="src/TicketHub.Domain/TicketHub.Domain.csproj" />
+    <Project Path="src/TicketHub.Infrastructure/TicketHub.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TicketHub.ArchitectureTests/TicketHub.ArchitectureTests.csproj" />
+    <Project Path="tests/TicketHub.IntegrationTests/TicketHub.IntegrationTests.csproj" />
+    <Project Path="tests/TicketHub.UnitTests/TicketHub.UnitTests.csproj" />
+  </Folder>
+</Solution>

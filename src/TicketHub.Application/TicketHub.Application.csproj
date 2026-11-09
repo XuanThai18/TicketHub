@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\TicketHub.Domain\TicketHub.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="FluentValidation.DependencyInjectionExtensions" />
+    <!-- 12.5.0 là bản MIT cuối; từ 13.x MediatR cần license thương mại -->
+    <PackageReference Include="MediatR" />
+    <!-- Query handler viết LINQ (ToListAsync, AsNoTracking...). Không tham chiếu provider Npgsql: SQL riêng của Postgres đi qua Dapper. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+  </ItemGroup>
+
+</Project>

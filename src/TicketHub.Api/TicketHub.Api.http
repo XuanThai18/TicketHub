@@ -1,0 +1,9 @@
+@TicketHub.Api_HostAddress = http://localhost:5315
+
+GET {{TicketHub.Api_HostAddress}}/health/live
+
+###
+
+GET {{TicketHub.Api_HostAddress}}/health/ready
+
+###
