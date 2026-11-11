@@ -22,7 +22,7 @@ internal sealed class TicketTypeConfiguration : IEntityTypeConfiguration<TicketT
                 "max_quantity_per_order > 0 AND max_quantity_per_order <= total_quantity");
         });
 
-        builder.Property(tt => tt.Name).HasMaxLength(TicketType.NameMaxLength).IsRequired();
+        builder.Property(tt => tt.Name).HasMaxLength(TicketType.NameMaxLength).IsRequired().UseCollation("case_insensitive");
         builder.Property(tt => tt.Description).HasMaxLength(TicketType.DescriptionMaxLength);
         builder.Property(tt => tt.Price).HasPrecision(18, 2);
 
