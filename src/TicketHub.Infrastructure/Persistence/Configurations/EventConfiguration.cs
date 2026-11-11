@@ -15,6 +15,7 @@ internal sealed class EventConfiguration : IEntityTypeConfiguration<Event>
         builder.HasKey(e => e.Id);
 
         builder.Property(e => e.Name).HasMaxLength(Event.NameMaxLength).IsRequired();
+        builder.Property(e => e.Description).HasMaxLength(Event.DescriptionMaxLength);
         builder.Property(e => e.Venue).HasMaxLength(Event.VenueMaxLength).IsRequired();
 
         // Lưu enum dạng chữ ("Draft") thay vì số (1): đọc DB dễ, thêm giá trị mới không lệch số.

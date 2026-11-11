@@ -7,6 +7,7 @@ namespace TicketHub.Domain.Events;
 public sealed class Event : Entity
 {
     public const int NameMaxLength = 200;
+    public const int DescriptionMaxLength = 2000;
     public const int VenueMaxLength = 300;
 
     private Event() { } // For EF Core
