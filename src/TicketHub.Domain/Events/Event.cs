@@ -100,6 +100,9 @@ public sealed class Event : Entity
         return Result.Success();
     }
 
+    public Result EnsureEditable() =>
+    Status == EventStatus.Draft ? Result.Success() : EventErrors.NotEditable;
+
     private static bool IsValidSchedule(
         DateTimeOffset startsAt,
         DateTimeOffset endsAt,

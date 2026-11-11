@@ -10,4 +10,6 @@ public static class TicketTypeErrors
         "TicketTypes.InvalidMaxQuantityPerOrder", "Max quantity per order must be greater than 0 and less than or equal to total quantity.");
     public static readonly Error TotalBelowSold = Error.Conflict(
     "TicketTypes.TotalBelowSold", "Total quantity cannot be less than the number of tickets already sold.");
+    public static Error DuplicateName(string name) => Error.Conflict(
+    "TicketTypes.DuplicateName", $"A ticket type named '{name}' already exists in this event.");
 }
