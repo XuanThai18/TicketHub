@@ -46,7 +46,8 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         .HasColumnName("deleted_by");
 
                     b.Property<string>("Description")
-                        .HasColumnType("text")
+                        .HasMaxLength(2000)
+                        .HasColumnType("character varying(2000)")
                         .HasColumnName("description");
 
                     b.Property<DateTimeOffset>("EndsAt")
@@ -105,6 +106,101 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         {
                             t.HasCheckConstraint("ck_events_schedule", "sale_starts_at < sale_ends_at AND sale_ends_at <= starts_at AND starts_at < ends_at");
                         });
+                });
+
+            modelBuilder.Entity("TicketHub.Domain.TicketTypes.TicketType", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<int>("AvailableQuantity")
+                        .HasColumnType("integer")
+                        .HasColumnName("available_quantity");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("created_by");
+
+                    b.Property<DateTimeOffset?>("DeletedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("deleted_at");
+
+                    b.Property<string>("DeletedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("deleted_by");
+
+                    b.Property<string>("Description")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)")
+                        .HasColumnName("description");
+
+                    b.Property<Guid>("EventId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("event_id");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_deleted");
+
+                    b.Property<int>("MaxQuantityPerOrder")
+                        .HasColumnType("integer")
+                        .HasColumnName("max_quantity_per_order");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)")
+                        .HasColumnName("name");
+
+                    b.Property<decimal>("Price")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)")
+                        .HasColumnName("price");
+
+                    b.Property<int>("TotalQuantity")
+                        .HasColumnType("integer")
+                        .HasColumnName("total_quantity");
+
+                    b.Property<DateTimeOffset?>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Id")
+                        .HasName("pk_ticket_types");
+
+                    b.HasIndex("EventId", "Name")
+                        .IsUnique()
+                        .HasDatabaseName("ix_ticket_types_event_id_name")
+                        .HasFilter("is_deleted = false");
+
+                    b.ToTable("ticket_types", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_ticket_types_max_quantity_per_order", "max_quantity_per_order > 0 AND max_quantity_per_order <= total_quantity");
+
+                            t.HasCheckConstraint("ck_ticket_types_price", "price >= 0");
+
+                            t.HasCheckConstraint("ck_ticket_types_total_quantity", "total_quantity > 0 AND available_quantity >= 0 AND available_quantity <= total_quantity");
+                        });
+                });
+
+            modelBuilder.Entity("TicketHub.Domain.TicketTypes.TicketType", b =>
+                {
+                    b.HasOne("TicketHub.Domain.Events.Event", null)
+                        .WithMany()
+                        .HasForeignKey("EventId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_ticket_types_events_event_id");
                 });
 #pragma warning restore 612, 618
         }
