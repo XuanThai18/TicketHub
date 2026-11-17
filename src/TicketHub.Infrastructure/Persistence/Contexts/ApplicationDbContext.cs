@@ -17,5 +17,8 @@ public class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options
             typeof(ApplicationDbContext).Assembly,
             t => t.Namespace?.StartsWith(ModulesNamespace, StringComparison.Ordinal) != true);
         ApplySoftDeleteQueryFilter(modelBuilder);
+
+        // So sánh chuỗi không phân biệt hoa thường (VIP = vip); dùng cho các cột cần unique theo kiểu đó.
+        modelBuilder.HasCollation("case_insensitive", locale: "und-u-ks-level2", provider: "icu", deterministic: false);
     }
 }
