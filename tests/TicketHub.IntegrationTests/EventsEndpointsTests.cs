@@ -1,8 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
-using TicketHub.Api.Common;
+using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Events;
+using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Events;
 using TicketHub.Domain.Common;
 
@@ -135,26 +136,91 @@ public sealed class EventsEndpointsTests(ApiFactory factory)
         Assert.Equal("Events.InvalidSchedule", await CodeAsync(response));
     }
 
+    // ---------- Danh sách ----------
+
+    [Theory]
+    [InlineData("page=0")]
+    [InlineData("pageSize=0")]
+    [InlineData("pageSize=101")]
+    public async Task List_InvalidPaging_Returns400(string queryString)
+    {
+        using var anonymous = factory.CreateClient();
+
+        using var response = await anonymous.GetAsync($"{Events}?{queryString}", Ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task List_SearchIsCaseInsensitive_AndHidesDrafts()
+    {
+        // DB dùng chung giữa các test: gắn mã riêng vào tên để chỉ lọc ra sự kiện của test này.
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var anonymous = factory.CreateClient();
+        var tag = Guid.NewGuid().ToString("N");
+        var published = await CreatePublishedEventAsync(admin, $"Rock {tag}");
+        await CreateEventAsync(admin, NewEvent($"Rock {tag} nháp"));
+
+        var page = await anonymous.GetFromJsonAsync<PagedResult<ListEventsResponse>>(
+            $"{Events}?search=ROCK%20{tag.ToUpperInvariant()}", Ct);
+
+        var item = Assert.Single(page!.Items);
+        Assert.Equal(published, item.Id);
+        Assert.Equal(1, page.TotalCount);
+    }
+
+    [Fact]
+    public async Task List_PagesInStartOrder()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var anonymous = factory.CreateClient();
+        var tag = Guid.NewGuid().ToString("N");
+        // Tạo lệch thứ tự ngày diễn ra để chắc kết quả được sắp theo ngày, không theo thứ tự tạo.
+        var third = await CreatePublishedEventAsync(admin, $"C {tag}", startInDays: 13);
+        var first = await CreatePublishedEventAsync(admin, $"A {tag}", startInDays: 11);
+        var second = await CreatePublishedEventAsync(admin, $"B {tag}", startInDays: 12);
+
+        var page1 = await anonymous.GetFromJsonAsync<PagedResult<ListEventsResponse>>(
+            $"{Events}?search={tag}&page=1&pageSize=2", Ct);
+        var page2 = await anonymous.GetFromJsonAsync<PagedResult<ListEventsResponse>>(
+            $"{Events}?search={tag}&page=2&pageSize=2", Ct);
+
+        Assert.Equal([first, second], page1!.Items.Select(e => e.Id));
+        Assert.Equal([third], page2!.Items.Select(e => e.Id));
+        Assert.Equal(3, page1.TotalCount);
+        Assert.Equal(2, page1.TotalPages);
+    }
+
     // ---------- Hàm phụ ----------
 
-    private static CreateEventRequest NewEvent()
+    private static CreateEventRequest NewEvent(string? name = null, int startInDays = 11)
     {
         var saleStart = DateTimeOffset.UtcNow.AddDays(1);
         return new CreateEventRequest(
-            Name: $"Concert {Guid.NewGuid():N}",
+            Name: name ?? $"Concert {Guid.NewGuid():N}",
             Description: null,
             Venue: "Nhà hát",
-            StartsAt: saleStart.AddDays(11),
-            EndsAt: saleStart.AddDays(11).AddHours(3),
+            StartsAt: saleStart.AddDays(startInDays),
+            EndsAt: saleStart.AddDays(startInDays).AddHours(3),
             SaleStartsAt: saleStart,
             SaleEndsAt: saleStart.AddDays(10));
     }
 
-    private static async Task<Guid> CreateEventAsync(HttpClient admin)
+    private static async Task<Guid> CreateEventAsync(HttpClient admin, CreateEventRequest? request = null)
     {
-        using var response = await admin.PostAsJsonAsync(Events, NewEvent(), Ct);
+        using var response = await admin.PostAsJsonAsync(Events, request ?? NewEvent(), Ct);
         response.EnsureSuccessStatusCode();
         return (await response.Content.ReadFromJsonAsync<CreatedResponse>(Ct))!.Id;
+    }
+
+    // Publish cần ít nhất một loại vé nên thêm sẵn một loại.
+    private static async Task<Guid> CreatePublishedEventAsync(HttpClient admin, string name, int startInDays = 11)
+    {
+        var id = await CreateEventAsync(admin, NewEvent(name, startInDays));
+        await AddTicketTypeAsync(admin, id, "Thường", 100_000m);
+        using var response = await admin.PostAsync($"{Events}/{id}/publish", null, Ct);
+        response.EnsureSuccessStatusCode();
+        return id;
     }
 
     private static async Task AddTicketTypeAsync(HttpClient admin, Guid eventId, string name, decimal price)

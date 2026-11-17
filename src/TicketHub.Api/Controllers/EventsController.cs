@@ -2,7 +2,7 @@ using Asp.Versioning;
 using MediatR;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using TicketHub.Api.Common;
+using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Events;
 using TicketHub.Api.Extensions;
 using TicketHub.Application.Events;
@@ -79,6 +79,11 @@ public sealed class EventsController(ISender sender) : BaseApiController
 
         return CreatedOrProblem(result, _ => $"/api/v1/events/{id}");
     }
+
+    [HttpGet]
+    [AllowAnonymous]
+    public async Task<IActionResult> ListEvents([FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 10, CancellationToken cancellationToken = default)
+       => HandleResult(await sender.Send(new ListEventsQuery(search, page, pageSize), cancellationToken));
 
     private IActionResult CreatedOrProblem(Result<Guid> result, Func<Guid, string> location) =>
         result.IsFailure ? ToProblem(result.Error) : Created(location(result.Value), new CreatedResponse(result.Value));
