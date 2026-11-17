@@ -13,5 +13,3 @@ public sealed record UpdateEventRequest(
 
 public sealed record AddTicketTypeRequest(
     string Name, string? Description, decimal Price, int TotalQuantity, int MaxQuantityPerOrder);
-
-public sealed record CreatedResponse(Guid Id);

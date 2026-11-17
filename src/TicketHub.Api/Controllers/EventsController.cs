@@ -2,6 +2,7 @@ using Asp.Versioning;
 using MediatR;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using TicketHub.Api.Common;
 using TicketHub.Api.Contracts.Events;
 using TicketHub.Api.Extensions;
 using TicketHub.Application.Events;
