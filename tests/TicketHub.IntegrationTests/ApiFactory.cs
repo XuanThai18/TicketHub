@@ -35,10 +35,14 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         await _redis.DisposeAsync();
     }
 
-    public HttpClient CreateAuthenticatedClient(params string[] roles)
+    public HttpClient CreateAuthenticatedClient(params string[] roles) =>
+        CreateAuthenticatedClient(Guid.NewGuid(), roles);
+
+    // Sub của token là Id người dùng (GUID), giống user thật; handler đặt hàng cần đọc được GUID này.
+    public HttpClient CreateAuthenticatedClient(Guid userId, params string[] roles)
     {
         var client = CreateClient();
-        var token = Services.GetRequiredService<JwtTokenIssuer>().Issue("test-user", roles, TimeSpan.FromMinutes(10));
+        var token = Services.GetRequiredService<JwtTokenIssuer>().Issue(userId.ToString(), roles, TimeSpan.FromMinutes(10));
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return client;
     }

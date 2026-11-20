@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using TicketHub.Application.Abstractions;
 using TicketHub.Infrastructure.Auth;
+using TicketHub.Infrastructure.Orders;
 using TicketHub.Infrastructure.Persistence;
 using TicketHub.Infrastructure.Persistence.Contexts;
 using TicketHub.Infrastructure.Persistence.Interceptors;
@@ -45,6 +46,7 @@ public static class DependencyInjection
         DapperConfiguration.Configure();
         services.AddRepositories();
         services.AddAuthModule();
+        services.AddHostedService<OrderExpiryService>();
 
         services.AddStackExchangeRedisCache(options =>
         {

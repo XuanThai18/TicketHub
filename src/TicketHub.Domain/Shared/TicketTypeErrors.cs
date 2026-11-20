@@ -4,12 +4,24 @@ public static class TicketTypeErrors
 {
     public static readonly Error InvalidPrice = Error.Validation(
         "TicketTypes.InvalidPrice", "Price must be greater than or equal to 0.");
+
     public static readonly Error InvalidTotalQuantity = Error.Validation(
         "TicketTypes.InvalidTotalQuantity", "Total quantity must be greater than 0.");
+
     public static readonly Error InvalidMaxQuantityPerOrder = Error.Validation(
         "TicketTypes.InvalidMaxQuantityPerOrder", "Max quantity per order must be greater than 0 and less than or equal to total quantity.");
+
     public static readonly Error TotalBelowSold = Error.Conflict(
-    "TicketTypes.TotalBelowSold", "Total quantity cannot be less than the number of tickets already sold.");
+        "TicketTypes.TotalBelowSold", "Total quantity cannot be less than the number of tickets already sold.");
+
+    public static readonly Error UnreserveExceedsTotal = Error.Conflict(
+        "TicketTypes.UnreserveExceedsTotal", "Unreserved quantity would exceed the total quantity.");
+
     public static Error DuplicateName(string name) => Error.Conflict(
-    "TicketTypes.DuplicateName", $"A ticket type named '{name}' already exists in this event.");
+        "TicketTypes.DuplicateName", $"A ticket type named '{name}' already exists in this event.");
+    public static readonly Error InvalidReserveQuantity = Error.Validation(
+    "TicketTypes.InvalidReserveQuantity", "Reserved quantity must be greater than 0.");
+
+    public static readonly Error SoldOut = Error.Conflict(
+        "TicketTypes.SoldOut", "Not enough tickets available.");
 }
