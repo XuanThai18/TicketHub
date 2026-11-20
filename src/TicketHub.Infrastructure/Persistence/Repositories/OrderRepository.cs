@@ -17,6 +17,24 @@ internal sealed class OrderRepository(ApplicationDbContext dbContext) : IOrderRe
         return rows == 1;
     }
 
+    // Cùng kiểu với huỷ: chỉ luồng đổi được Pending mới nhận 1 dòng. Điều kiện hết hạn nằm trong UPDATE nên job không huỷ nhầm đơn còn hạn.
+    public async Task<bool> TryExpirePendingAsync(Guid id, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var rows = await dbContext.Set<Order>()
+            .Where(o => o.Id == id && o.Status == OrderStatus.Pending && o.ExpiresAt <= now)
+            .ExecuteUpdateAsync(s => s.SetProperty(o => o.Status, OrderStatus.Expired), cancellationToken);
+        return rows == 1;
+    }
+
+    public async Task<IReadOnlyList<Guid>> GetExpiredPendingIdsAsync(DateTimeOffset now, int limit, CancellationToken cancellationToken) =>
+        await dbContext.Set<Order>()
+            .AsNoTracking()
+            .Where(o => o.Status == OrderStatus.Pending && o.ExpiresAt <= now)
+            .OrderBy(o => o.ExpiresAt)
+            .Select(o => o.Id)
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
     // Tải kèm Items để huỷ đơn còn biết cần trả bao nhiêu vé cho từng loại. Có tracking vì sẽ đổi trạng thái.
     public Task<Order?> GetByIdAsync(Guid id, CancellationToken cancellationToken) =>
         dbContext.Set<Order>()

@@ -1,10 +1,17 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Events;
+using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Events;
+using TicketHub.Application.Orders;
 using TicketHub.Domain.Common;
+using TicketHub.Domain.Orders;
+using TicketHub.Infrastructure.Persistence.Contexts;
 
 namespace TicketHub.IntegrationTests;
 
@@ -154,7 +161,186 @@ public sealed class OrdersEndpointsTests(ApiFactory factory)
         }
     }
 
+    // ---------- Xem đơn ----------
+
+    [Fact]
+    public async Task GetById_WithoutToken_Returns401()
+    {
+        using var anonymous = factory.CreateClient();
+
+        using var response = await anonymous.GetAsync($"{Orders}/{Guid.NewGuid()}", Ct);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetById_Owner_Returns200WithItems()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(user, (ticketId, 2));
+
+        var order = await user.GetFromJsonAsync<OrderDetailResponse>($"{Orders}/{orderId}", Ct);
+
+        Assert.NotNull(order);
+        Assert.Equal(orderId, order.Id);
+        Assert.Equal(eventId, order.EventId);
+        Assert.Equal("Pending", order.Status);
+        Assert.Equal(1_000_000m, order.TotalAmount);
+        var item = Assert.Single(order.Items);
+        Assert.Equal(ticketId, item.TicketTypeId);
+        Assert.Equal("VIP", item.TicketTypeName);
+        Assert.Equal(2, item.Quantity);
+        Assert.Equal(1_000_000m, item.Subtotal);
+    }
+
+    [Fact]
+    public async Task GetById_OtherUsersOrder_Returns404()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var owner = factory.CreateAuthenticatedClient(Roles.User);
+        using var stranger = factory.CreateAuthenticatedClient(Roles.User);
+        var (_, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(owner, (ticketId, 1));
+
+        using var response = await stranger.GetAsync($"{Orders}/{orderId}", Ct);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("Orders.NotFound", await CodeAsync(response));
+    }
+
+    [Fact]
+    public async Task GetById_Admin_CanSeeAnyOrder()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var owner = factory.CreateAuthenticatedClient(Roles.User);
+        var (_, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(owner, (ticketId, 1));
+
+        using var response = await admin.GetAsync($"{Orders}/{orderId}", Ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ListMy_ReturnsOnlyOwnOrdersNewestFirst()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        using var other = factory.CreateAuthenticatedClient(Roles.User);
+        var (_, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var first = await PlaceOrderAsync(user, (ticketId, 1));
+        var second = await PlaceOrderAsync(user, (ticketId, 2));
+        await PlaceOrderAsync(other, (ticketId, 1));
+
+        var page = await user.GetFromJsonAsync<PagedResult<OrderSummaryResponse>>($"{Orders}/my", Ct);
+
+        Assert.NotNull(page);
+        Assert.Equal(2, page.TotalCount);
+        Assert.Equal(new[] { second, first }, page.Items.Select(o => o.Id));
+        Assert.Equal(2, page.Items[0].TicketCount);
+    }
+
+    [Fact]
+    public async Task ListMy_InvalidPageSize_Returns400()
+    {
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+
+        using var response = await user.GetAsync($"{Orders}/my?pageSize=0", Ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // ---------- Hết hạn đơn ----------
+
+    [Fact]
+    public async Task Expire_DueOrder_ReturnsStockAndMarksExpired()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(user, (ticketId, 2));
+        await MakeExpiredAsync(orderId);
+
+        await SweepAsync();
+
+        Assert.Equal(OrderStatus.Expired, await StatusAsync(orderId));
+        Assert.Equal(10, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Fact]
+    public async Task Expire_OrderNotDue_IsLeftAlone()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(user, (ticketId, 2));
+
+        await SweepAsync();
+
+        Assert.Equal(OrderStatus.Pending, await StatusAsync(orderId));
+        Assert.Equal(8, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Fact]
+    public async Task Expire_SweptTwice_ReturnsStockOnlyOnce()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(user, (ticketId, 2));
+        await MakeExpiredAsync(orderId);
+
+        await SweepAsync();
+        await SweepAsync();
+
+        Assert.Equal(10, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Fact]
+    public async Task Cancel_AfterExpired_Returns409AndKeepsStock()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var orderId = await PlaceOrderAsync(user, (ticketId, 2));
+        await MakeExpiredAsync(orderId);
+        await SweepAsync();
+
+        using var response = await user.PostAsync($"{Orders}/{orderId}/cancel", null, Ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("Orders.NotCancellable", await CodeAsync(response));
+        Assert.Equal(10, await AvailableAsync(admin, eventId, ticketId));
+    }
+
     // ---------- Hàm phụ ----------
+
+    // Đưa hạn giữ chỗ về quá khứ để job coi là đã hết hạn (không chờ 10 phút thật).
+    private async Task MakeExpiredAsync(Guid orderId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        await db.Set<Order>()
+            .Where(o => o.Id == orderId)
+            .ExecuteUpdateAsync(s => s.SetProperty(o => o.ExpiresAt, DateTimeOffset.UtcNow.AddMinutes(-1)), Ct);
+    }
+
+    private async Task SweepAsync()
+    {
+        using var scope = factory.Services.CreateScope();
+        var sender = scope.ServiceProvider.GetRequiredService<ISender>();
+        var result = await sender.Send(new ExpireDueOrdersCommand(BatchSize: 100), Ct);
+        Assert.True(result.IsSuccess);
+    }
+
+    private async Task<OrderStatus> StatusAsync(Guid orderId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.Set<Order>().AsNoTracking().Where(o => o.Id == orderId).Select(o => o.Status).SingleAsync(Ct);
+    }
 
     private static async Task<Guid> PlaceOrderAsync(HttpClient user, params (Guid TicketTypeId, int Quantity)[] lines)
     {

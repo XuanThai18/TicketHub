@@ -7,4 +7,10 @@ public interface IOrderRepository
 
     /// <summary>Chuyển Pending → Cancelled bằng một UPDATE có điều kiện. Trả true chỉ khi chính lời gọi này đổi được.</summary>
     Task<bool> TryCancelPendingAsync(Guid id, CancellationToken cancellationToken);
+
+    /// <summary>Chuyển Pending → Expired khi đã hết hạn giữ chỗ, bằng một UPDATE có điều kiện. Trả true chỉ khi chính lời gọi này đổi được.</summary>
+    Task<bool> TryExpirePendingAsync(Guid id, DateTimeOffset now, CancellationToken cancellationToken);
+
+    /// <summary>Id các đơn Pending đã hết hạn, cũ nhất trước, tối đa <paramref name="limit"/> đơn.</summary>
+    Task<IReadOnlyList<Guid>> GetExpiredPendingIdsAsync(DateTimeOffset now, int limit, CancellationToken cancellationToken);
 }

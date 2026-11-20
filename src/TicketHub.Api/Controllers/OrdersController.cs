@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Orders;
+using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Orders;
 using TicketHub.Domain.Shared;
 
@@ -28,6 +29,21 @@ public sealed class OrdersController(ISender sender) : BaseApiController
         var result = await sender.Send(new PlaceOrderCommand(lines), cancellationToken);
         return CreatedOrProblem(result, id => $"/api/v1/orders/{id}");
     }
+
+    [HttpGet("my")]
+    [Authorize]
+    [ProducesResponseType<PagedResult<OrderSummaryResponse>>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> ListMyOrders(
+        [FromQuery] int page = 1, [FromQuery] int pageSize = 10, CancellationToken cancellationToken = default) =>
+        HandleResult(await sender.Send(new ListMyOrdersQuery(page, pageSize), cancellationToken));
+
+    [HttpGet("{id:guid}")]
+    [Authorize]
+    [ProducesResponseType<OrderDetailResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> GetOrderById(Guid id, CancellationToken cancellationToken) =>
+        HandleResult(await sender.Send(new GetOrderByIdQuery(id), cancellationToken));
 
     [HttpPost("{id:guid}/cancel")]
     [Authorize]

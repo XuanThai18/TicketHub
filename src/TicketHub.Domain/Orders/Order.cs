@@ -54,15 +54,6 @@ public sealed class Order : Entity
         return order;
     }
 
-    public Result Expire(DateTimeOffset now)
-    {
-        if (Status != OrderStatus.Pending || now < ExpiresAt)
-            return OrderErrors.NotExpirable;
-
-        Status = OrderStatus.Expired;
-        return Result.Success();
-    }
-
     private static Error? Validate(IReadOnlyList<(TicketType TicketType, int Quantity)> lines)
     {
         if (lines.Count == 0)
