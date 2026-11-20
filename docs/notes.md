@@ -91,3 +91,90 @@ query = query.Where(e => e.Name.ToLower().Contains(search));   // EF dịch thà
 - **Unit test** (xUnit + NSubstitute): luật của entity và từng nhánh của handler (không tìm thấy, sai trạng thái, trùng tên, lỗi lúc lưu…). Kiểm cả việc **không** gọi `SaveChanges` khi thất bại.
 - **Integration test** (Testcontainers, Postgres + Redis thật): đi hết đường HTTP → DB, gồm phân quyền 401/403, mã lỗi trong ProblemDetails, collation, phân trang.
 - DB dùng chung giữa các integration test, nên test cần đếm số dòng phải gắn mã riêng (`Guid`) vào tên rồi lọc theo mã đó.
+
+---
+
+## Ticket 2: Đặt vé, giữ chỗ, huỷ, hết hạn
+
+### 1. Mỗi đơn chỉ chứa vé của một sự kiện
+
+`Order.Create` từ chối đơn có loại vé thuộc nhiều sự kiện (`Orders.MixedEvents`), và lưu `EventId` ngay trên đơn.
+
+- **Vì sao:** thanh toán, hoàn tiền và huỷ sự kiện đều xử lý theo đơn. Một đơn trộn hai sự kiện thì khi một sự kiện bị huỷ phải tách đơn hoặc hoàn tiền một phần, phức tạp mà không có lợi gì cho người mua.
+- Các luật khác trong `Order.Create`: đơn không rỗng, không lặp loại vé (`DuplicateTicketType`), số lượng > 0 và ≤ `max_per_order`.
+- `unit_price` chụp giá lúc đặt; `TotalAmount` tính từ các dòng.
+
+### 2. Giữ chỗ: trừ vé ngay lúc đặt, hết hạn sau 10 phút
+
+- Đặt vé trừ `available_quantity` **ngay**, đơn ở `Pending`, `ExpiresAt = now + Order.ReservationMinutes` (10 phút). `now` lấy từ `TimeProvider` để test được.
+- **Vì sao trừ ngay:** người đã đặt chắc chắn còn vé trong lúc đi thanh toán. Cái giá là vé bị giữ bởi người bỏ ngang, nên phải có job trả vé khi hết hạn (mục 6).
+- Sự kiện phải `Published` và đang trong khung `[SaleStartsAt, SaleEndsAt)`, sai thì `Orders.NotOnSale` (409).
+
+### 3. `PlaceOrder` hiện là bản đơn giản và sẽ bán vượt
+
+Luồng hiện tại: đọc loại vé → `Reserve` trừ trong bộ nhớ → `SaveChanges`.
+
+- `SaveChanges` tự mở một transaction ngầm, nên đơn và số vé cùng lưu hoặc cùng không. Nhưng transaction đó **không** chặn được hai request cùng đọc `available = 1`, cùng trừ, cùng lưu: lần ghi sau đè lần ghi trước (lost update) và vé bị bán quá.
+- **Cố ý để vậy:** Ticket 3 viết test chứng minh lỗi rồi so sánh ba cách sửa.
+
+### 4. Huỷ đơn: UPDATE có điều kiện, không đọc rồi mới ghi
+
+```csharp
+// OrderRepository.TryCancelPendingAsync
+UPDATE orders SET status = 'Cancelled' WHERE id = @id AND status = 'Pending'   -- trả true khi đổi được đúng 1 dòng
+
+// TicketTypeRepository.TryReturnStockAsync
+UPDATE ticket_types SET available_quantity = available_quantity + @n
+WHERE id = @id AND available_quantity + @n <= total_quantity
+```
+
+Hai câu chạy trong **một** transaction (`IUnitOfWork.ExecuteInTransactionAsync`). Cộng vé lỗi thì rollback luôn câu đổi trạng thái.
+
+- **Vì sao lo, khi chỉ một người huỷ đơn của mình?** Vẫn có hai luồng cùng chạm một đơn: người dùng bấm hai lần hoặc app tự retry, hoặc người dùng huỷ đúng lúc job hết hạn chạy. Nếu đọc `Status == Pending` trong C# rồi mới ghi, cả hai luồng đều thấy `Pending` và cùng cộng vé → kho bị cộng hai lần.
+- **Vì sao UPDATE có điều kiện thì đúng:** điều kiện nằm trong chính câu ghi. Ở mức `READ COMMITTED`, UPDATE thứ hai phải chờ UPDATE thứ nhất commit, rồi kiểm lại `WHERE` trên dòng mới, thấy `Cancelled` nên đổi 0 dòng → trả `Orders.NotCancellable` (409) và không cộng vé.
+- **Vì sao cộng vé bằng SQL:** `available_quantity + @n` tính trong DB, không đọc giá trị lên C# rồi ghi lại, nên không bị lost update khi có người đặt vé cùng lúc.
+- Đơn của người khác trả **404** như đơn không tồn tại, để không lộ việc đơn đó có tồn tại.
+- Thành công trả **204** (không có body).
+- **Lưu ý khi sửa code:** chép `(TicketTypeId, Quantity)` ra biến thường **trước** khi vào transaction. Khi execution strategy chạy lại, `ChangeTracker` bị xoá nên entity đã load không còn dùng được.
+- **Giới hạn:** `ExecuteUpdate` bỏ qua `AuditableEntityInterceptor`, nên `updated_at/updated_by` không được điền khi huỷ hoặc hết hạn. Cần thì thêm `SetProperty` cho hai cột đó.
+- Lỗi `TicketTypes.UnreserveExceedsTotal` lẽ ra không bao giờ xảy ra; nếu có thì dữ liệu kho đã lệch từ trước.
+
+### 5. Bỏ `Order.Cancel`, `Order.Expire`, `TicketType.Unreserve`
+
+Khi luật trạng thái đã nằm trong `WHERE` của câu UPDATE, các method domain kiểm cùng luật đó không còn ai gọi, lại dễ lệch với SQL nếu sau này sửa một bên. Nên xoá.
+
+- **Đánh đổi:** luật "chỉ huỷ / hết hạn khi `Pending`" giờ nằm ở repository (SQL), không ở entity. Vì vậy nó được chứng minh bằng integration test chạy trên Postgres thật, không phải unit test entity.
+
+### 6. Job hết hạn đơn
+
+```
+OrderExpiryService (BackgroundService, PeriodicTimer 30s)
+  → ExpireDueOrdersCommand(BatchSize: 100)
+      → GetExpiredPendingIdsAsync: Pending AND expires_at <= now, cũ nhất trước, tối đa 100
+      → mỗi Id: ExpireOrderCommand (transaction riêng, cùng kiểu với huỷ đơn)
+```
+
+- `ExpireOrderCommand` giống huỷ đơn, chỉ khác điều kiện: `status = 'Pending' AND expires_at <= @now`. Đơn vừa bị huỷ, vừa được thanh toán, hay chưa tới hạn đều đổi 0 dòng → `Orders.NotExpirable`, không trả vé.
+- **Chạy lặp không sao:** quét hai lần, hay hai instance cùng quét, vẫn chỉ trả vé một lần nhờ UPDATE có điều kiện (chỉ tốn công chứ không sai).
+- **Mỗi đơn một transaction:** một đơn lỗi được ghi log rồi bỏ qua, không làm rollback hay chặn các đơn khác.
+- **Lỗi cả lượt quét không làm sập app:** từ .NET 6, exception thoát khỏi `BackgroundService` mặc định **dừng cả host**. Vì vậy vòng lặp bắt lỗi (trừ `OperationCanceledException` lúc tắt app), ghi log, rồi chờ lượt sau.
+- **Cũ nhất trước:** khi tồn hơn 100 đơn, đơn chờ lâu nhất được trả vé trước và mỗi lượt lấy đúng nhóm đó. Index `(status, expires_at)` phục vụ đúng truy vấn này.
+- Phần quét nằm ở Application (`ExpireDueOrdersCommand`), service ở Infrastructure chỉ hẹn giờ. Nhờ vậy integration test gọi thẳng qua `ISender`, không phải đợi timer.
+- **Giới hạn:**
+  - Đơn được trả vé chậm nhất khoảng 30 giây sau `ExpiresAt`.
+  - Tối đa 100 đơn mỗi 30 giây. Nếu tồn nhiều hơn thì tăng `BatchSize` hoặc lặp lại trong cùng một lượt cho tới khi hết.
+  - Tiền về sau khi đơn đã `Expired` (vé đã trả kho) để Ticket 4 xử lý.
+
+### 7. Đọc đơn
+
+- `GET /orders/my`: chỉ đơn của người gọi, phân trang (`PageSize` 1–100), sắp `CreatedAt` giảm dần rồi `Id` giảm dần. `Id` là Guid v7 tăng theo thời gian nên phá hoà đúng thứ tự.
+- `GET /orders/{id}`: chủ đơn hoặc Admin; người khác **404**.
+- Tên sự kiện và tên loại vé lấy bằng **truy vấn con** chứ không `JOIN`. Nếu sự kiện hoặc loại vé đã bị xoá mềm, query filter loại nó ra: `JOIN` sẽ làm **mất cả đơn**, còn truy vấn con chỉ cho tên `null` và đơn vẫn hiện.
+
+### 8. Test
+
+- **Unit:** handler huỷ và hết hạn mock `IUnitOfWork.ExecuteInTransactionAsync` để chạy thẳng delegate, rồi kiểm nhánh: không phải chủ đơn, UPDATE đổi 0 dòng (không được cộng vé), cộng vé lỗi.
+- **Integration:**
+  - `Cancel_ConcurrentRequests_...` bắn hai request huỷ cùng lúc bằng `Task.WhenAll`: đúng một 204, một 409, kho chỉ cộng một lần.
+  - Test hết hạn đẩy `expires_at` về quá khứ bằng SQL thay vì thay `TimeProvider` của cả app. Đồng hồ giả dùng chung sẽ ảnh hưởng cả JWT và phiên đăng nhập của các test khác.
+- **Bẫy:** `HttpStatusCode` sắp theo số (204 < 409). Assert danh sách mã trạng thái sau `OrderBy` phải viết `[NoContent, Conflict]`.
