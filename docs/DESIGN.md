@@ -202,18 +202,19 @@ erDiagram
 
 | Endpoint | Quyền | Việc |
 |---|---|---|
-| `POST /api/v1/orders` | User | Body `{ items: [{ ticketTypeId, quantity }] }` → đơn `Pending`, **trừ `available_quantity`**, `expires_at` = +10' |
-| `GET /api/v1/orders/my` | User | Đơn của tôi |
-| `GET /api/v1/orders/{id}` | Chủ đơn / Admin | Chi tiết (người khác → **404**) |
-| `POST /api/v1/orders/{id}/cancel` | Chủ đơn | Huỷ đơn `Pending`, **trả lại vé** |
+| `POST /api/v1/orders` | User | Body `{ lines: [{ ticketTypeId, quantity }] }` → đơn `Pending`, **trừ `available_quantity`**, `expires_at` = +10' |
+| `GET /api/v1/orders/my` | User | Đơn của tôi, phân trang, mới nhất trước |
+| `GET /api/v1/orders/{id}` | Chủ đơn / Admin | Chi tiết kèm từng dòng vé (người khác → **404**) |
+| `POST /api/v1/orders/{id}/cancel` | Chủ đơn | Huỷ đơn `Pending`, **trả lại vé** → **204** |
 
-- **`OrderExpiryService`** (background service): mỗi 30 giây chuyển đơn `Pending` có `expires_at < now` sang `Expired`, trả lại vé.
-- **Luật:** sự kiện `Published` và đang trong thời gian mở bán; số lượng ≤ `max_per_order`.
+- **`OrderExpiryService`** (background service): mỗi 30 giây lấy tối đa 100 đơn `Pending` có `expires_at <= now` (cũ nhất trước), chuyển từng đơn sang `Expired` và trả lại vé, mỗi đơn một transaction.
+- Huỷ và hết hạn đổi trạng thái bằng **UPDATE có điều kiện** (`WHERE status = 'Pending'`) và cộng vé bằng SQL, nên bấm huỷ hai lần hay huỷ trùng lúc job chạy vẫn chỉ trả vé một lần. Chi tiết ở `notes.md`, Ticket 2 mục 4.
+- **Luật:** sự kiện `Published` và đang trong thời gian mở bán; một đơn chỉ chứa vé của một sự kiện; số lượng ≤ `max_per_order`.
 - Viết **phiên bản đơn giản** (đọc → kiểm → trừ → lưu). Nó **sẽ bán vượt** khi đông người — chủ ý để Ticket 3 chứng minh rồi sửa.
 
 **Hoàn thành khi:**
-- [ ] Đặt vé trừ đúng số; huỷ / hết hạn trả lại đúng số
-- [ ] Test cho job hết hạn (dùng `TimeProvider` giả để không phải đợi 10 phút)
+- [x] Đặt vé trừ đúng số; huỷ / hết hạn trả lại đúng số
+- [x] Test cho job hết hạn: unit test handler dùng `TimeProvider` cố định; integration test đẩy `expires_at` về quá khứ bằng SQL để không phải đợi 10 phút
 
 ### Ticket 3 — Chống bán vượt
 
@@ -305,7 +306,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 
 - [x] Giai đoạn 0–2: tạo dự án từ template, chạy local, đăng nhập được
 - [ ] Ticket 1 — Sự kiện + loại vé
-- [ ] Ticket 2 — Đặt vé, giữ chỗ
+- [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
 - [ ] Ticket 3 — Chống bán vượt
 - [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
 - [ ] Ticket 5 — RabbitMQ + Outbox
