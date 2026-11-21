@@ -18,26 +18,33 @@ internal sealed class OrderExpiryService(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(_interval, timeProvider);
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        try
         {
-            try
+            while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await using var scope = scopeFactory.CreateAsyncScope();
-                var sender = scope.ServiceProvider.GetRequiredService<ISender>();
-                var result = await sender.Send(new ExpireDueOrdersCommand(BatchSize), stoppingToken);
-                if (result.IsSuccess && result.Value > 0)
+                try
                 {
-                    if (logger.IsEnabled(LogLevel.Information))
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var sender = scope.ServiceProvider.GetRequiredService<ISender>();
+                    var result = await sender.Send(new ExpireDueOrdersCommand(BatchSize), stoppingToken);
+                    if (result.IsSuccess && result.Value > 0)
                     {
-                        logger.LogInformation("Expired {Count} pending order(s) and returned their tickets.", result.Value);
+                        if (logger.IsEnabled(LogLevel.Information))
+                        {
+                            logger.LogInformation("Expired {Count} pending order(s) and returned their tickets.", result.Value);
+                        }
                     }
                 }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Lỗi DB tạm thời không được làm sập host (BackgroundService mặc định dừng cả app khi ném lỗi).
+                    logger.LogError(ex, "Order expiry sweep failed; will retry on the next tick.");
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Lỗi DB tạm thời không được làm sập host (BackgroundService mặc định dừng cả app khi ném lỗi).
-                logger.LogError(ex, "Order expiry sweep failed; will retry on the next tick.");
-            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // App đang tắt: stoppingToken bị huỷ khi đang chờ lượt quét hoặc đang quét dở. Dừng êm, không phải lỗi.
         }
     }
 }
