@@ -234,7 +234,6 @@ erDiagram
 - [x] Test 50 request đỏ trên code Ticket 2 (50 đơn cho 10 vé), xanh với cả 3 cách
 - [x] Bảng so sánh A / B / C trong `notes.md`, Ticket 3 (B cần ~280 lần thử lại; B giới hạn 3 lần thì bán thiếu)
 - [x] Bản cuối dùng C: trừ vé bằng UPDATE có điều kiện trong transaction, các dòng trừ theo thứ tự `TicketTypeId`
-- [ ] `TicketType.Update` của admin vẫn có lost update — dự định dùng `xmin` (cách B)
 
 ### Ticket 4 — Thanh toán và idempotency
 

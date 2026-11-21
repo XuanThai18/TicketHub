@@ -226,6 +226,6 @@ Mỗi cách một nhánh thử nghiệm, giữ lại để đối chiếu (khôn
 
 ### 5. Việc còn để ngỏ
 
-- **`TicketType.Update` (admin sửa tổng số vé) vẫn bị lost update:** nó đọc `AvailableQuantity`, tính lại rồi ghi đè. Nếu admin lưu đúng lúc có người đang mua, phần vé vừa bị trừ có thể bị ghi đè mất. Chỗ này ít tranh chấp, nên cách hợp là B (`xmin`). Mẫu cấu hình nằm ở nhánh `ticket-3b-optimistic`.
+- **Khi thêm endpoint sửa loại vé, phải kèm `xmin`:** hiện chưa có endpoint, handler hay test nào gọi `TicketType.Update`, nên chưa có lost update thật. Nhưng hàm này đọc `AvailableQuantity`, tính lại rồi ghi đè: nếu sau này có endpoint mà admin lưu đúng lúc có người mua hoặc huỷ, phần vé vừa đổi sẽ bị ghi đè mất. Chỗ đó ít tranh chấp nên dùng B (`xmin`), xung đột thì trả 409 để admin tải lại, không tự thử lại. Mẫu cấu hình và migration nằm ở nhánh `ticket-3b-optimistic`.
 - Migration cho `xmin` sinh ra `AddColumn("xmin")` nhưng Npgsql bỏ qua cột hệ thống khi tạo SQL, nên không có cột mới nào được tạo. Module Auth cũng dựa vào hành vi này.
 - Xem số liệu của test: `dotnet test tests/TicketHub.IntegrationTests --filter-method "*NeverOversell" --output Detailed`, rồi tìm dòng `[oversell]`.
