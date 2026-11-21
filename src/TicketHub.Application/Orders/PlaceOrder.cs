@@ -51,7 +51,7 @@ public sealed class PlaceOrderCommandHandler(
         {
             if (!byId.ContainsKey(line.TicketTypeId))
             {
-                return Error.NotFound("TicketTypes.NotFound", $"Ticket type '{line.TicketTypeId}' was not found.");
+                return TicketTypeErrors.NotFound(line.TicketTypeId);
             }
         }
 

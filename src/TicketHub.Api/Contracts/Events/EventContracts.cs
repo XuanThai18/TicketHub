@@ -13,3 +13,7 @@ public sealed record UpdateEventRequest(
 
 public sealed record AddTicketTypeRequest(
     string Name, string? Description, decimal Price, int TotalQuantity, int MaxQuantityPerOrder);
+
+/// <summary>Gửi giá trị mới cho mọi trường (vd TotalQuantity = 300 để thêm 100 vé vào 200). Id lấy từ đường dẫn.</summary>
+public sealed record UpdateTicketTypeRequest(
+    string Name, string? Description, decimal Price, int TotalQuantity, int MaxQuantityPerOrder);

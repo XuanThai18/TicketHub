@@ -31,4 +31,7 @@ internal sealed class TicketTypeRepository(ApplicationDbContext dbContext) : ITi
     }
 
     public Task<bool> NameExistsAsync(Guid eventId, string name, CancellationToken cancellationToken) => dbContext.Set<TicketType>().AnyAsync(tt => tt.EventId == eventId && tt.Name == name, cancellationToken);
+
+    public Task<bool> NameExistsForOtherAsync(Guid eventId, Guid excludeId, string name, CancellationToken cancellationToken) =>
+        dbContext.Set<TicketType>().AnyAsync(tt => tt.EventId == eventId && tt.Id != excludeId && tt.Name == name, cancellationToken);
 }

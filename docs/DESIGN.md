@@ -188,6 +188,7 @@ erDiagram
 | `POST /api/v1/events` | Admin, Manager | Tạo sự kiện (`Draft`) |
 | `PUT /api/v1/events/{id}` | Admin, Manager | Sửa (chỉ khi `Draft`) |
 | `POST /api/v1/events/{id}/ticket-types` | Admin, Manager | Thêm loại vé |
+| `PUT /api/v1/events/{id}/ticket-types/{ticketTypeId}` | Admin | Sửa loại vé, **kể cả khi đang bán** (gửi giá trị mới, vd tổng 200 → 300); chống ghi đè bằng `xmin` |
 | `POST /api/v1/events/{id}/publish` | Admin, Manager | Công bố (≥ 1 loại vé) |
 | `POST /api/v1/events/{id}/cancel` | Admin | Huỷ |
 | `GET /api/v1/events` | **ẩn danh** | Danh sách `Published`: phân trang, tìm theo tên, lọc theo ngày |

@@ -6,6 +6,9 @@ public interface ITicketTypeRepository
     void Add(TicketType ticketType);
     Task<int> CountByEventIdAsync(Guid eventId, CancellationToken cancellationToken);
     Task<bool> NameExistsAsync(Guid eventId, string name, CancellationToken cancellationToken);
+
+    /// <summary>Có loại vé khác (không tính <paramref name="excludeId"/>) cùng sự kiện đã dùng tên này chưa.</summary>
+    Task<bool> NameExistsForOtherAsync(Guid eventId, Guid excludeId, string name, CancellationToken cancellationToken);
     Task<IReadOnlyList<TicketType>> GetByIdsAsync(IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
 
     /// <summary>Trừ vé bằng một UPDATE có điều kiện còn đủ vé. Trả false nếu không đủ (hoặc loại vé không còn).</summary>

@@ -226,6 +226,48 @@ Mỗi cách một nhánh thử nghiệm, giữ lại để đối chiếu (khôn
 
 ### 5. Việc còn để ngỏ
 
-- **Khi thêm endpoint sửa loại vé, phải kèm `xmin`:** hiện chưa có endpoint, handler hay test nào gọi `TicketType.Update`, nên chưa có lost update thật. Nhưng hàm này đọc `AvailableQuantity`, tính lại rồi ghi đè: nếu sau này có endpoint mà admin lưu đúng lúc có người mua hoặc huỷ, phần vé vừa đổi sẽ bị ghi đè mất. Chỗ đó ít tranh chấp nên dùng B (`xmin`), xung đột thì trả 409 để admin tải lại, không tự thử lại. Mẫu cấu hình và migration nằm ở nhánh `ticket-3b-optimistic`.
+- **Sửa loại vé khi đang bán:** đã làm bằng `xmin`, xem phần "Sửa loại vé khi đang bán" bên dưới.
 - Migration cho `xmin` sinh ra `AddColumn("xmin")` nhưng Npgsql bỏ qua cột hệ thống khi tạo SQL, nên không có cột mới nào được tạo. Module Auth cũng dựa vào hành vi này.
 - Xem số liệu của test: `dotnet test tests/TicketHub.IntegrationTests --filter-method "*NeverOversell" --output Detailed`, rồi tìm dòng `[oversell]`.
+
+---
+
+## Sửa loại vé khi đang bán
+
+`PUT /api/v1/events/{id}/ticket-types/{ticketTypeId}` cho admin sửa tên, mô tả, giá, tổng số vé, số tối đa mỗi đơn, **kể cả khi sự kiện đang `Published`**. Ví dụ VIP bán chạy, admin tăng tổng từ 200 lên 300.
+
+### 1. Gửi giá trị mới, không gửi phần thêm
+
+- Body mang giá trị tuyệt đối: `totalQuantity = 300`, không phải `+100`. Số vé còn được tính lại: `available = tổng mới − đã bán`.
+- Luật trong `TicketType.Update`: tổng mới không được nhỏ hơn số đã bán (`TotalBelowSold`). Đổi giá chỉ áp cho đơn mới, đơn cũ giữ `unit_price` đã chụp.
+- Sự kiện `Cancelled` thì không sửa được (`TicketTypes.EventCancelled`). Loại vé không thuộc sự kiện trên URL thì **404**, giống loại vé không tồn tại.
+- **Vì sao gửi giá trị mới chứ không gửi phần thêm:** tổng số vé thường bị chốt bởi sức chứa thật của địa điểm, nên ý định của admin là "tổng phải bằng 300", không phải "cộng thêm 100". Hai admin cùng muốn nâng lên 300 thì `PUT` cho ra 300 (đúng), còn kiểu "thêm 100" sẽ ra 400 và bán vượt sức chứa. Chỉ khi mỗi admin được giao mở thêm một phần riêng thì mới cần endpoint "thêm N vé" (`SET total = total + N`).
+- **Giới hạn:** `xmin` chỉ bảo vệ khoảng đọc → lưu trong handler, không bảo vệ lúc admin đang nhìn form với số cũ (mở form lúc 200, người khác đã sửa thành 250, admin vẫn gõ 300). Nếu cần chặn trường hợp đó thì gửi kèm phiên bản admin đã thấy (header `If-Match`), để sau.
+
+### 2. Vì sao cần `xmin`
+
+Handler đọc loại vé → `Update` tính lại `AvailableQuantity` trong bộ nhớ → lưu. Nếu có người mua chen vào giữa lúc đọc và lúc lưu, bản admin đang giữ vẫn là số vé cũ, lưu xuống sẽ **ghi đè mất vé vừa bị trừ** (lost update, cùng loại lỗi với Ticket 3).
+
+- `xmin` là cột hệ thống của Postgres, chứa mã transaction đã ghi dòng gần nhất. Mọi câu ghi vào dòng đều đổi nó, **kể cả các `ExecuteUpdate` của đặt vé, huỷ, hết hạn** vốn không đi qua EF tracker. Vì vậy không tự thêm cột `version`: phải nhớ tăng nó ở từng câu SQL, quên một chỗ là mất tác dụng.
+- EF nhớ `xmin` lúc đọc, lúc lưu thêm `AND xmin = @cũ` vào `WHERE`. Khớp 0 dòng thì ném `DbUpdateConcurrencyException`, `AppDbContextBase` đổi thành `ConcurrencyConflictException`.
+- Cấu hình: `builder.Property<uint>("Version").IsRowVersion()`. Migration `AddTicketTypeVersion` có `AddColumn("xmin")` nhưng Npgsql bỏ qua cột hệ thống khi sinh SQL, nên không có cột mới.
+
+### 3. Xung đột thì tự thử lại 3 lần, rồi mới trả 409
+
+- Ý của admin là giá trị tuyệt đối, nên đọc lại số mới rồi áp lại là đúng ý họ. Mỗi lần thử đều kiểm lại `TotalBelowSold` trên số đã bán mới nhất.
+- Handler gọi `ExecuteInTransactionAsync`: khi có exception, UnitOfWork xoá tracker, nhờ vậy lần sau đọc được bản mới thay vì bản cũ đã track.
+- Hết 3 lần thì trả 409 `TicketTypes.ConcurrentUpdate` để admin bấm lưu lại.
+- **Số liệu:** trong test đua (50 người mua cùng lúc admin lưu), 2 trên 3 lần chạy handler hết 3 lượt và admin phải bấm lại 1 lần. Trong lúc bán rất chạy, 3 lần là hơi ít. Có thể tăng, hoặc chuyển phần đổi tổng sang UPDATE nguyên tử (không bao giờ xung đột).
+
+### 4. Chứng minh
+
+| Test | Có `xmin` | Tạm tắt `xmin` |
+|---|---|---|
+| `SaveAfterConcurrentPurchase_...`: admin đọc → 1 người mua → admin lưu | Ném `ConcurrencyConflictException`, kho giữ đúng 9 | Lưu thành công, **ghi đè** vé vừa bán |
+| `RaiseTotalWhileBuyersRace_...`: 50 người mua cùng lúc admin tăng 10 → 20, sau đó 20 người nữa | Bán đúng 20, kho 0 | **Bán 22 vé cho tổng 20** (cả 2 lần chạy) |
+
+Khi tắt `xmin` để thử phải tạm bỏ qua cảnh báo `PendingModelChangesWarning` (model lệch snapshot), nếu không `Migrate` lúc khởi động sẽ báo lỗi.
+
+### 5. Kiểm tên trùng sau khi kiểm loại vé thuộc sự kiện
+
+Bản đầu kiểm tên trước: gọi URL của sự kiện khác (cũng có loại vé tên "VIP") thì nhận **409 trùng tên** thay vì 404. Integration test bắt được, nay kiểm tên sau bước tìm loại vé.
