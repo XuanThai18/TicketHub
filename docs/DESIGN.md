@@ -247,6 +247,11 @@ erDiagram
 
 - **Ca khó:** đơn đã `Expired` (vé đã trả về kho) mà tiền về muộn → không xuất vé, đánh dấu cần hoàn tiền.
 
+**Hoàn thành khi:**
+- [x] 4.1 `Idempotency-Key` cho đặt vé: gửi lại cùng key → 201 cùng đơn + header `Idempotent-Replayed`; khác nội dung → 422; 20 request cùng key cùng lúc → đúng 1 đơn
+- [ ] 4.2 Thanh toán + webhook HMAC, webhook gọi lại chỉ xử lý một lần
+- [ ] 4.3 Sinh vé; tiền về khi đơn đã `Expired` → không xuất vé, đánh dấu hoàn tiền
+
 ### Ticket 5 — Email vé qua RabbitMQ + Outbox
 
 - Đơn chuyển `Paid` → ghi `outbox_messages` **trong cùng transaction** (`IUnitOfWork.ExecuteInTransactionAsync`).

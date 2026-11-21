@@ -283,3 +283,50 @@ Khi tắt `xmin` để thử phải tạm bỏ qua cảnh báo `PendingModelChan
 ### 5. Kiểm tên trùng sau khi kiểm loại vé thuộc sự kiện
 
 Bản đầu kiểm tên trước: gọi URL của sự kiện khác (cũng có loại vé tên "VIP") thì nhận **409 trùng tên** thay vì 404. Integration test bắt được, nay kiểm tên sau bước tìm loại vé.
+
+---
+
+## Ticket 4.1: Idempotency-Key cho đặt vé
+
+### 1. Bài toán và cách client dùng
+
+Client bấm "Đặt vé", mạng chập chờn không nhận được phản hồi, app tự gửi lại. Không có chống gửi lặp thì người dùng có **nhiều đơn và bị trừ vé nhiều lần**.
+
+- Client tự sinh một key (thường là UUID) cho **mỗi lần mua**, gửi trong header `Idempotency-Key`, và gửi lại **đúng key đó** khi thử lại.
+- Header không bắt buộc: không gửi thì như trước, luôn tạo đơn mới.
+- Key có phạm vi trong từng user (unique index `(user_id, idempotency_key)`): hai user tình cờ trùng key vẫn là hai đơn.
+
+**Chứng minh lỗi trước khi sửa:** 20 request cùng key bắn cùng lúc tạo ra **5 đơn** (5 × 2 vé là hết 10 vé), các request còn lại nhận `SoldOut`.
+
+### 2. Hành vi
+
+| Tình huống | Kết quả |
+|---|---|
+| Key mới | Tạo đơn, lưu key trên đơn, **201** |
+| Cùng key, cùng nội dung | **201** y hệt lần đầu (cùng `id`, cùng `Location`) + header `Idempotent-Replayed: true`; không trừ vé, không tạo đơn |
+| Cùng key, khác nội dung | **422** `Orders.IdempotencyKeyReused` |
+| Nhiều request cùng key cùng lúc | Đúng **một** đơn; các request còn lại nhận replay, không ai lỗi |
+| Lần đầu thất bại (hết vé, chưa mở bán...) | Không lưu gì; gửi lại cùng key thì chạy lại từ đầu |
+| Header rỗng, toàn khoảng trắng, hoặc > 100 ký tự | **400** |
+
+- **Vì sao 201 khi replay:** client chỉ cần một nhánh xử lý thành công; header `Idempotent-Replayed` cho biết đây là đơn cũ.
+- **Vì sao 422 khi khác nội dung:** theo bản nháp IETF "Idempotency-Key HTTP Header Field". Thêm `ErrorType.Unprocessable` → 422 trong `ToProblem`.
+- **So nội dung bằng các dòng đơn** (`Order.HasSameLines`): so tập `(ticketTypeId, quantity)` với `order_items`, không tính thứ tự. Không cần cột lưu hash request.
+- **Key giữ vĩnh viễn** vì nằm trên chính đơn hàng: gửi lại key của đơn đã hết hạn/huỷ thì nhận lại đơn đó với trạng thái hiện tại. Không cần job dọn key.
+- Lần đầu thất bại thì **không lưu** kết quả lỗi (khác Stripe, vốn lưu cả lỗi). Lý do: không có đơn để gắn key, và thử lại sau khi có người trả vé là hợp lý với người mua.
+
+### 3. Hai đường xử lý
+
+```
+0. Có key → tìm đơn theo (user_id, key) → có thì replay/422 ngay          ← gửi lại sau vài giây
+1–4. Luồng đặt vé như Ticket 3 (UPDATE trừ vé + INSERT đơn có key, 1 transaction)
+5. INSERT vấp ix_orders_user_id_idempotency_key → tìm lại đơn → replay/422  ← nhiều request cùng lúc
+```
+
+- **Bước 0 đặt trước mọi kiểm tra khác:** lần gửi lại vẫn nhận đơn cũ dù lúc đó sự kiện đã hết giờ bán.
+- **Bước 5 không cần khoá riêng.** Hai request cùng qua bước 0 (chưa ai commit). Request đến sau INSERT cùng `(user_id, key)` thì Postgres bắt nó **chờ** request trước commit rồi báo `23505 unique_violation`. Transaction của nó rollback nên **vé vừa trừ tự trả lại**. `AppDbContextBase` đổi lỗi thành `UniqueConstraintException`, handler đọc đơn của request thắng và trả replay.
+- Handler chỉ coi là gửi lặp khi `ConstraintName` đúng là `ix_orders_user_id_idempotency_key` (hằng `PlaceOrderCommandHandler.IdempotencyKeyIndex`). Trùng unique index khác thì để exception đi lên.
+
+### 4. Bẫy: header rỗng bị coi như không gửi
+
+Giá trị header bị cắt khoảng trắng hai đầu, và model binding đổi chuỗi rỗng thành `null`. Kết quả: gửi `Idempotency-Key: "   "` trông y như không gửi header, và đơn được tạo **không có chống gửi lặp** mà client không biết. Controller kiểm `Request.Headers.ContainsKey(...)` để giữ lại chuỗi rỗng, validator trả 400. Integration test `PlaceOrder_InvalidKey_Returns400` bắt được lỗi này.

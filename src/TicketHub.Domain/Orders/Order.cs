@@ -30,7 +30,8 @@ public sealed class Order : Entity
     public static Result<Order> Create(
         Guid userId,
         IReadOnlyList<(TicketType TicketType, int Quantity)> lines,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        string? idempotencyKey = null)
     {
         if (Validate(lines) is { } error)
             return error;
@@ -42,7 +43,8 @@ public sealed class Order : Entity
             UserId = userId,
             EventId = lines[0].TicketType.EventId,
             Status = OrderStatus.Pending,
-            ExpiresAt = now.AddMinutes(ReservationMinutes)
+            ExpiresAt = now.AddMinutes(ReservationMinutes),
+            IdempotencyKey = idempotencyKey
         };
 
         foreach (var (ticketType, quantity) in lines)
@@ -53,6 +55,14 @@ public sealed class Order : Entity
         order.TotalAmount = order._items.Sum(i => i.Quantity * i.UnitPrice);
         return order;
     }
+
+    /// <summary>
+    /// Đơn này có đúng các dòng (loại vé, số lượng) như yêu cầu không, không tính thứ tự.
+    /// Dùng khi gửi lại cùng Idempotency-Key: cùng nội dung thì trả lại đơn cũ, khác thì là dùng nhầm key.
+    /// </summary>
+    public bool HasSameLines(IEnumerable<(Guid TicketTypeId, int Quantity)> lines) =>
+        _items.Select(i => (i.TicketTypeId, i.Quantity)).ToHashSet()
+            .SetEquals(lines);
 
     private static Error? Validate(IReadOnlyList<(TicketType TicketType, int Quantity)> lines)
     {

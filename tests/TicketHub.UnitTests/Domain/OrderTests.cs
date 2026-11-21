@@ -120,4 +120,43 @@ public sealed class OrderTests
 
         Assert.True(result.IsSuccess);
     }
+
+    // ---------- So dòng khi gửi lại cùng Idempotency-Key ----------
+
+    [Fact]
+    public void Create_WithIdempotencyKey_StoresKey()
+    {
+        var order = Order.Create(_userId, [(GivenTicketType(_eventA), 1)], _now, idempotencyKey: "key-1").Value;
+
+        Assert.Equal("key-1", order.IdempotencyKey);
+    }
+
+    [Fact]
+    public void HasSameLines_SameLinesInAnotherOrder_IsTrue()
+    {
+        var vip = GivenTicketType(_eventA, "VIP");
+        var normal = GivenTicketType(_eventA, "Thường");
+        var order = Order.Create(_userId, [(vip, 2), (normal, 1)], _now).Value;
+
+        Assert.True(order.HasSameLines([(normal.Id, 1), (vip.Id, 2)]));
+    }
+
+    [Fact]
+    public void HasSameLines_DifferentQuantity_IsFalse()
+    {
+        var vip = GivenTicketType(_eventA);
+        var order = Order.Create(_userId, [(vip, 2)], _now).Value;
+
+        Assert.False(order.HasSameLines([(vip.Id, 3)]));
+    }
+
+    [Fact]
+    public void HasSameLines_ExtraLine_IsFalse()
+    {
+        var vip = GivenTicketType(_eventA, "VIP");
+        var normal = GivenTicketType(_eventA, "Thường");
+        var order = Order.Create(_userId, [(vip, 2)], _now).Value;
+
+        Assert.False(order.HasSameLines([(vip.Id, 2), (normal.Id, 1)]));
+    }
 }

@@ -40,4 +40,11 @@ internal sealed class OrderRepository(ApplicationDbContext dbContext) : IOrderRe
         dbContext.Set<Order>()
             .Include(o => o.Items)
             .FirstOrDefaultAsync(o => o.Id == id, cancellationToken);
+
+    // Chỉ đọc để so nội dung và trả lại đơn cũ: không tracking, đi đúng unique index (user_id, idempotency_key).
+    public Task<Order?> GetByIdempotencyKeyAsync(Guid userId, string idempotencyKey, CancellationToken cancellationToken) =>
+        dbContext.Set<Order>()
+            .AsNoTracking()
+            .Include(o => o.Items)
+            .FirstOrDefaultAsync(o => o.UserId == userId && o.IdempotencyKey == idempotencyKey, cancellationToken);
 }

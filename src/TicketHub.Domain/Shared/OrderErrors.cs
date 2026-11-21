@@ -28,4 +28,9 @@ public static class OrderErrors
 
     public static Error NotFound(Guid id) => Error.NotFound(
         "Orders.NotFound", $"Order '{id}' was not found.");
+
+    // 422 theo bản nháp IETF "Idempotency-Key HTTP Header Field": cùng key nhưng nội dung yêu cầu khác.
+    public static readonly Error IdempotencyKeyReused = Error.Unprocessable(
+        "Orders.IdempotencyKeyReused",
+        "This Idempotency-Key was already used for a different order. Generate a new key for a new purchase.");
 }

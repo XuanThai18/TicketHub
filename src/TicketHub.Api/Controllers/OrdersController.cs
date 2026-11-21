@@ -6,7 +6,6 @@ using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Orders;
 using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Orders;
-using TicketHub.Domain.Shared;
 
 namespace TicketHub.Api.Controllers;
 
@@ -20,14 +19,38 @@ public sealed class OrdersController(ISender sender) : BaseApiController
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    public async Task<IActionResult> PlaceOrder([FromBody] PlaceOrderRequest request, CancellationToken cancellationToken)
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public async Task<IActionResult> PlaceOrder(
+        [FromBody] PlaceOrderRequest request,
+        [FromHeader(Name = IdempotencyKeyHeader)] string? idempotencyKey,
+        CancellationToken cancellationToken)
     {
         var lines = request.Lines
             .Select(l => new PlaceOrderLine(l.TicketTypeId, l.Quantity))
             .ToList();
 
-        var result = await sender.Send(new PlaceOrderCommand(lines), cancellationToken);
-        return CreatedOrProblem(result, id => $"/api/v1/orders/{id}");
+        // Header gửi rỗng (hoặc toàn khoảng trắng, bị cắt thành rỗng) bị model binding đổi thành null, trông như không gửi.
+        // Giữ lại chuỗi rỗng để validator trả 400, thay vì âm thầm tạo đơn không chống gửi lặp.
+        if (idempotencyKey is null && Request.Headers.ContainsKey(IdempotencyKeyHeader))
+        {
+            idempotencyKey = string.Empty;
+        }
+
+        var result = await sender.Send(new PlaceOrderCommand(lines, idempotencyKey), cancellationToken);
+        if (result.IsFailure)
+        {
+            return ToProblem(result.Error);
+        }
+
+        // Gửi lặp cùng key vẫn trả 201 y hệt lần đầu, để client chỉ cần một nhánh xử lý thành công;
+        // header cho biết đây là đơn cũ, không phải vừa tạo.
+        var (orderId, replayed) = result.Value;
+        if (replayed)
+        {
+            Response.Headers[IdempotentReplayedHeader] = "true";
+        }
+
+        return Created($"/api/v1/orders/{orderId}", new CreatedResponse(orderId));
     }
 
     [HttpGet("my")]
@@ -56,6 +79,6 @@ public sealed class OrdersController(ISender sender) : BaseApiController
         return HandleResult(result);
     }
 
-    private IActionResult CreatedOrProblem(Result<Guid> result, Func<Guid, string> location) =>
-        result.IsFailure ? ToProblem(result.Error) : Created(location(result.Value), new CreatedResponse(result.Value));
+    private const string IdempotencyKeyHeader = "Idempotency-Key";
+    private const string IdempotentReplayedHeader = "Idempotent-Replayed";
 }
