@@ -34,8 +34,8 @@ public sealed class GetEventByIdQueryHandler(IReadDbContext readDbContext, ICurr
 {
     public async Task<Result<EventDetailResponse>> Handle(GetEventByIdQuery request, CancellationToken cancellationToken)
     {
-        // bản nháp chỉ Admin thấy, còn bản công khai thì ai cũng thấy
-        var canSeeDraft = currentUser.IsInRole(Roles.Admin);
+        // Bản nháp chỉ ban tổ chức (Admin, Manager) thấy, vì họ là người tạo và sửa nó; bản công khai thì ai cũng thấy.
+        var canSeeDraft = currentUser.IsInRole(Roles.Admin) || currentUser.IsInRole(Roles.Manager);
 
         var ev = await readDbContext.Query<Event>()
                 .Where(e => e.Id == request.Id && (canSeeDraft || e.Status != EventStatus.Draft))
