@@ -23,7 +23,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
         => HandleResult(await sender.Send(new GetEventByIdQuery(id), cancellationToken));
 
     [HttpPost]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireManagerRole)]
     [ProducesResponseType<CreatedResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> CreateEvent([FromBody] CreateEventRequest request, CancellationToken cancellationToken)
@@ -35,7 +35,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
     }
 
     [HttpPut("{id:guid}")]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireManagerRole)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
@@ -49,7 +49,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
     }
 
     [HttpPost("{id:guid}/publish")]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireManagerRole)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
@@ -58,7 +58,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
         HandleResult(await sender.Send(new PublishEventCommand(id), cancellationToken));
 
     [HttpPost("{id:guid}/cancel")]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireAdminRole)] // huỷ sự kiện ảnh hưởng mọi người đã mua: chỉ Admin
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
@@ -66,7 +66,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
         HandleResult(await sender.Send(new CancelEventCommand(id), cancellationToken));
 
     [HttpPost("{id:guid}/ticket-types")]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireManagerRole)]
     [ProducesResponseType<CreatedResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
@@ -81,7 +81,7 @@ public sealed class EventsController(ISender sender) : BaseApiController
     }
 
     [HttpPut("{id:guid}/ticket-types/{ticketTypeId:guid}")]
-    [Authorize(Policy = Policies.RequireAdminRole)]
+    [Authorize(Policy = Policies.RequireManagerRole)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
@@ -94,8 +94,14 @@ public sealed class EventsController(ISender sender) : BaseApiController
 
     [HttpGet]
     [AllowAnonymous]
-    public async Task<IActionResult> ListEvents([FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 10, CancellationToken cancellationToken = default)
-       => HandleResult(await sender.Send(new ListEventsQuery(search, page, pageSize), cancellationToken));
+    public async Task<IActionResult> ListEvents(
+        [FromQuery] string? search,
+        [FromQuery] DateTimeOffset? from,
+        [FromQuery] DateTimeOffset? to,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 10,
+        CancellationToken cancellationToken = default)
+       => HandleResult(await sender.Send(new ListEventsQuery(search, page, pageSize, from, to), cancellationToken));
 
     private IActionResult CreatedOrProblem(Result<Guid> result, Func<Guid, string> location) =>
         result.IsFailure ? ToProblem(result.Error) : Created(location(result.Value), new CreatedResponse(result.Value));

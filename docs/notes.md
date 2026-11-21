@@ -53,9 +53,9 @@ Chỉ có bước 1 thì thiếu an toàn. Chỉ có bước 2 thì vẫn đúng
 
 ### 7. Ai thấy bản nháp
 
-- `GET /events/{id}`: Admin thấy mọi trạng thái; khách và User thường gọi vào bản nháp nhận **404** (không phải 403, để không lộ việc sự kiện tồn tại).
-- `GET /events` (danh sách): **chỉ hiện sự kiện không phải `Draft`**, kể cả với Admin. Sự kiện `Cancelled` vẫn hiện, kèm trạng thái.
-- **Việc còn để ngỏ:** Admin chưa có màn hình liệt kê bản nháp. Khi cần thì thêm `ICurrentUser` vào `ListEventsQueryHandler` giống `GetEventById`.
+- `GET /events/{id}`: Admin và Manager (ban tổ chức) thấy mọi trạng thái; khách và User thường gọi vào bản nháp nhận **404** (không phải 403, để không lộ việc sự kiện tồn tại).
+- `GET /events` (danh sách): **chỉ hiện sự kiện không phải `Draft`**, kể cả với Admin, Manager. Sự kiện `Cancelled` vẫn hiện, kèm trạng thái.
+- **Việc còn để ngỏ:** ban tổ chức chưa có màn hình liệt kê bản nháp. Khi cần thì thêm `ICurrentUser` vào `ListEventsQueryHandler` giống `GetEventById`.
 
 ### 8. Phân trang danh sách sự kiện
 
@@ -91,6 +91,18 @@ query = query.Where(e => e.Name.ToLower().Contains(search));   // EF dịch thà
 - **Unit test** (xUnit + NSubstitute): luật của entity và từng nhánh của handler (không tìm thấy, sai trạng thái, trùng tên, lỗi lúc lưu…). Kiểm cả việc **không** gọi `SaveChanges` khi thất bại.
 - **Integration test** (Testcontainers, Postgres + Redis thật): đi hết đường HTTP → DB, gồm phân quyền 401/403, mã lỗi trong ProblemDetails, collation, phân trang.
 - DB dùng chung giữa các integration test, nên test cần đếm số dòng phải gắn mã riêng (`Guid`) vào tên rồi lọc theo mã đó.
+
+### 12. Lọc theo ngày diễn
+
+- `GET /events?from=&to=` lọc theo `starts_at`: `from ≤ starts_at < to` (nửa mở, để hai khoảng liền nhau như "tuần này" và "tuần sau" không đếm trùng sự kiện ở mốc giữa). Bỏ trống một đầu thì không giới hạn đầu đó. `from` phải nhỏ hơn `to`, sai thì 400.
+- **Đổi mốc về UTC trước khi truy vấn:** client gửi giờ Việt Nam (`+07:00`) là bình thường, nhưng Npgsql chỉ nhận `DateTimeOffset` có offset 0 cho cột `timestamptz` và báo lỗi (API trả 500). `ToUniversalTime()` giữ nguyên thời điểm, chỉ đổi cách viết. Integration test gửi mốc `+07:00` để giữ chỗ này; bỏ `ToUniversalTime()` thì test đỏ.
+- Index `(status, starts_at)` đã có từ đầu phục vụ đúng truy vấn này.
+
+### 13. Quyền ban tổ chức: Admin và Manager
+
+- Tạo, sửa, công bố sự kiện, thêm và sửa loại vé dùng policy `RequireManagerRole` (Admin hoặc Manager). Manager cũng thấy bản nháp, vì họ là người tạo và sửa nó.
+- **Huỷ sự kiện chỉ Admin** (`RequireAdminRole`): ảnh hưởng mọi người đã mua và sau này kéo theo hoàn tiền.
+- Integration test: Manager đi hết luồng tạo → xem nháp → sửa → thêm loại vé → công bố → sửa loại vé; Manager huỷ sự kiện nhận 403.
 
 ---
 

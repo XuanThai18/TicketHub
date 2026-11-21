@@ -26,10 +26,16 @@ public sealed class ListEventsQueryValidator : AbstractValidator<ListEventsQuery
         RuleFor(x => x.Page).GreaterThanOrEqualTo(1);
         RuleFor(x => x.PageSize).InclusiveBetween(1, 100);
         RuleFor(x => x.Search).MaximumLength(Event.NameMaxLength);
+        RuleFor(x => x.From)
+            .LessThan(x => x.To)
+            .When(x => x.From is not null && x.To is not null)
+            .WithMessage("'From' must be earlier than 'To'.");
     }
 }
 
-public sealed record ListEventsQuery(string? Search, int Page, int PageSize) : IRequest<Result<PagedResult<ListEventsResponse>>>;
+/// <summary>Lọc theo giờ diễn: <c>From ≤ StartsAt &lt; To</c>. Bỏ trống một đầu thì không giới hạn đầu đó.</summary>
+public sealed record ListEventsQuery(string? Search, int Page, int PageSize, DateTimeOffset? From = null, DateTimeOffset? To = null)
+    : IRequest<Result<PagedResult<ListEventsResponse>>>;
 
 public sealed class ListEventsQueryHandler(IReadDbContext readDbContext) : IRequestHandler<ListEventsQuery, Result<PagedResult<ListEventsResponse>>>
 {
@@ -45,6 +51,19 @@ public sealed class ListEventsQueryHandler(IReadDbContext readDbContext) : IRequ
             #pragma warning disable CA1304, CA1311, CA1862
                         query = query.Where(e => e.Name.ToLower().Contains(search));
             #pragma warning restore CA1304, CA1311, CA1862
+        }
+
+        // Npgsql chỉ nhận DateTimeOffset offset 0 cho timestamptz: client gửi +07:00 thì đổi về UTC (cùng thời điểm).
+        if (request.From is { } from)
+        {
+            var fromUtc = from.ToUniversalTime();
+            query = query.Where(e => e.StartsAt >= fromUtc);
+        }
+
+        if (request.To is { } to)
+        {
+            var toUtc = to.ToUniversalTime();
+            query = query.Where(e => e.StartsAt < toUtc);
         }
 
         var totalCount = await query.CountAsync(cancellationToken);

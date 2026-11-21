@@ -191,7 +191,89 @@ public sealed class EventsEndpointsTests(ApiFactory factory)
         Assert.Equal(2, page1.TotalPages);
     }
 
+    // ---------- Lọc theo ngày diễn ----------
+
+    [Fact]
+    public async Task List_FilterByStartDate_ReturnsOnlyEventsInRange()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var anonymous = factory.CreateClient();
+        var tag = Guid.NewGuid().ToString("N");
+        // NewEvent đặt StartsAt = bây giờ + 1 ngày + startInDays → ba sự kiện diễn ra sau 12, 13, 14 ngày.
+        await CreatePublishedEventAsync(admin, $"A {tag}", startInDays: 11);
+        var middle = await CreatePublishedEventAsync(admin, $"B {tag}", startInDays: 12);
+        await CreatePublishedEventAsync(admin, $"C {tag}", startInDays: 13);
+
+        // Gửi mốc theo giờ Việt Nam (+07:00) để chắc server đổi về UTC đúng thời điểm.
+        var vietnam = TimeSpan.FromHours(7);
+        var from = DateTimeOffset.UtcNow.AddDays(12.5).ToOffset(vietnam);
+        var to = DateTimeOffset.UtcNow.AddDays(13.5).ToOffset(vietnam);
+        var page = await anonymous.GetFromJsonAsync<PagedResult<ListEventsResponse>>(
+            $"{Events}?search={tag}&from={Uri.EscapeDataString(from.ToString("o"))}&to={Uri.EscapeDataString(to.ToString("o"))}", Ct);
+
+        Assert.Equal([middle], page!.Items.Select(e => e.Id));
+        Assert.Equal(1, page.TotalCount);
+    }
+
+    [Fact]
+    public async Task List_FromNotBeforeTo_Returns400()
+    {
+        using var anonymous = factory.CreateClient();
+        var at = Uri.EscapeDataString(DateTimeOffset.UtcNow.AddDays(5).ToString("o"));
+
+        using var response = await anonymous.GetAsync($"{Events}?from={at}&to={at}", Ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // ---------- Quyền Manager (ban tổ chức) ----------
+
+    [Fact]
+    public async Task Manager_CanCreateSeeDraftEditAddTicketTypeAndPublish()
+    {
+        using var manager = factory.CreateAuthenticatedClient(Roles.Manager);
+        var eventId = await CreateEventAsync(manager);
+
+        // Manager phải xem lại được bản nháp mình vừa tạo.
+        using (var draft = await manager.GetAsync($"{Events}/{eventId}", Ct))
+        {
+            Assert.Equal(HttpStatusCode.OK, draft.StatusCode);
+        }
+
+        using (var updated = await manager.PutAsJsonAsync($"{Events}/{eventId}", ToUpdate(NewEvent($"Renamed {Guid.NewGuid():N}")), Ct))
+        {
+            Assert.Equal(HttpStatusCode.NoContent, updated.StatusCode);
+        }
+
+        await AddTicketTypeAsync(manager, eventId, "VIP", 500_000m);
+        var ticketId = (await manager.GetFromJsonAsync<EventDetailResponse>($"{Events}/{eventId}", Ct))!.TicketTypes.Single().Id;
+
+        using (var published = await manager.PostAsync($"{Events}/{eventId}/publish", null, Ct))
+        {
+            Assert.Equal(HttpStatusCode.NoContent, published.StatusCode);
+        }
+
+        using var edited = await manager.PutAsJsonAsync($"{Events}/{eventId}/ticket-types/{ticketId}",
+            new UpdateTicketTypeRequest("VIP", null, 550_000m, TotalQuantity: 120, MaxQuantityPerOrder: 4), Ct);
+        Assert.Equal(HttpStatusCode.NoContent, edited.StatusCode);
+    }
+
+    [Fact]
+    public async Task Manager_CannotCancelEvent_Returns403()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var manager = factory.CreateAuthenticatedClient(Roles.Manager);
+        var eventId = await CreatePublishedEventAsync(admin, $"Concert {Guid.NewGuid():N}");
+
+        using var response = await manager.PostAsync($"{Events}/{eventId}/cancel", null, Ct);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
     // ---------- Hàm phụ ----------
+
+    private static UpdateEventRequest ToUpdate(CreateEventRequest e) =>
+        new(e.Name, e.Description, e.Venue, e.StartsAt, e.EndsAt, e.SaleStartsAt, e.SaleEndsAt);
 
     private static CreateEventRequest NewEvent(string? name = null, int startInDays = 11)
     {

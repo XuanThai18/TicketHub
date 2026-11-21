@@ -188,16 +188,17 @@ erDiagram
 | `POST /api/v1/events` | Admin, Manager | Tạo sự kiện (`Draft`) |
 | `PUT /api/v1/events/{id}` | Admin, Manager | Sửa (chỉ khi `Draft`) |
 | `POST /api/v1/events/{id}/ticket-types` | Admin, Manager | Thêm loại vé |
-| `PUT /api/v1/events/{id}/ticket-types/{ticketTypeId}` | Admin | Sửa loại vé, **kể cả khi đang bán** (gửi giá trị mới, vd tổng 200 → 300); chống ghi đè bằng `xmin` |
+| `PUT /api/v1/events/{id}/ticket-types/{ticketTypeId}` | Admin, Manager | Sửa loại vé, **kể cả khi đang bán** (gửi giá trị mới, vd tổng 200 → 300); chống ghi đè bằng `xmin` |
 | `POST /api/v1/events/{id}/publish` | Admin, Manager | Công bố (≥ 1 loại vé) |
 | `POST /api/v1/events/{id}/cancel` | Admin | Huỷ |
-| `GET /api/v1/events` | **ẩn danh** | Danh sách `Published`: phân trang, tìm theo tên, lọc theo ngày |
-| `GET /api/v1/events/{id}` | **ẩn danh** | Chi tiết kèm loại vé và số vé còn |
+| `GET /api/v1/events` | **ẩn danh** | Danh sách (trừ `Draft`): phân trang, tìm theo tên, lọc theo ngày diễn `?from=&to=` (`from ≤ starts_at < to`) |
+| `GET /api/v1/events/{id}` | **ẩn danh** | Chi tiết kèm loại vé và số vé còn; bản nháp chỉ Admin, Manager thấy |
 
 **Hoàn thành khi:**
-- [ ] Migration tạo `events`, `ticket_types` (có `CHECK`), xem được bằng pgAdmin
-- [ ] Unit test: luật thời gian, luật công bố, chỉ sửa khi `Draft`
-- [ ] Integration test: User thường `POST /events` → 403; khách chưa đăng nhập `GET` được
+- [x] Migration tạo `events`, `ticket_types` (có `CHECK`), xem được bằng pgAdmin
+- [x] Unit test: luật thời gian, luật công bố, chỉ sửa khi `Draft`
+- [x] Integration test: User thường `POST /events` → 403; khách chưa đăng nhập `GET` được
+- [x] Lọc theo ngày diễn; Manager tạo/sửa/công bố/thêm và sửa loại vé được, huỷ sự kiện thì 403
 
 ### Ticket 2 — Đặt vé, giữ chỗ 10 phút
 
@@ -311,7 +312,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 ## 5. Tiến độ
 
 - [x] Giai đoạn 0–2: tạo dự án từ template, chạy local, đăng nhập được
-- [ ] Ticket 1 — Sự kiện + loại vé
+- [x] Ticket 1 — Sự kiện + loại vé
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
 - [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
 - [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
