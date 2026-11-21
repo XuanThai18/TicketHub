@@ -26,6 +26,10 @@ internal sealed class TicketTypeConfiguration : IEntityTypeConfiguration<TicketT
         builder.Property(tt => tt.Description).HasMaxLength(TicketType.DescriptionMaxLength);
         builder.Property(tt => tt.Price).HasPrecision(18, 2);
 
+        // Cột hệ thống xmin làm concurrency token. Mọi câu ghi vào dòng (kể cả UPDATE nguyên tử của đặt/huỷ vé)
+        // đều đổi xmin, nên admin lưu bản đã đọc trước đó sẽ nhận xung đột thay vì ghi đè số vé.
+        builder.Property<uint>("Version").IsRowVersion();
+
         builder.HasOne<Event>()
                 .WithMany()
                 .HasForeignKey(tt => tt.EventId)

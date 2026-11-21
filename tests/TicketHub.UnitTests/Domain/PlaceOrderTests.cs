@@ -1,3 +1,4 @@
+using System.Data;
 using NSubstitute;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Orders;
@@ -22,7 +23,21 @@ public sealed class PlaceOrderTests
     public PlaceOrderTests()
     {
         _currentUser.UserId.Returns(_userId.ToString());
+
+        // Transaction chạy thẳng delegate, để test thấy kết quả của bên trong.
+        _unitOfWork.ExecuteInTransactionAsync(
+                Arg.Any<Func<CancellationToken, Task<Result<Guid>>>>(), Arg.Any<IsolationLevel>(), Arg.Any<CancellationToken>())
+            .Returns(ci => ci.ArgAt<Func<CancellationToken, Task<Result<Guid>>>>(0)(CancellationToken.None));
+
+        // Mặc định: còn đủ vé.
+        _ticketTypes.TryReserveStockAsync(Arg.Any<Guid>(), Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(true);
     }
+
+    private void GivenSoldOut(TicketType ticket) =>
+        _ticketTypes.TryReserveStockAsync(ticket.Id, Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(false);
+
+    private Task<bool> DidNotReserveAny() =>
+        _ticketTypes.DidNotReceive().TryReserveStockAsync(Arg.Any<Guid>(), Arg.Any<int>(), Arg.Any<CancellationToken>());
 
     private PlaceOrderCommandHandler Handler() =>
         new(_currentUser, _events, _ticketTypes, _orders, _unitOfWork, new FixedTimeProvider(_now));
@@ -63,7 +78,7 @@ public sealed class PlaceOrderTests
     // ---------- Thành công ----------
 
     [Fact]
-    public async Task Handle_ValidOrder_ReservesTicketsAddsOrderAndSaves()
+    public async Task Handle_ValidOrder_ReservesStockAddsOrderAndSaves()
     {
         var ev = GivenEvent();
         var vip = GivenTicket(ev.Id);
@@ -72,10 +87,30 @@ public sealed class PlaceOrderTests
         var result = await Handler().Handle(CommandFor((vip, 2)), CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(8, vip.AvailableQuantity);
+        await _ticketTypes.Received(1).TryReserveStockAsync(vip.Id, 2, Arg.Any<CancellationToken>());
         _orders.Received(1).Add(Arg.Is<Order>(o =>
             o.Id == result.Value && o.UserId == _userId && o.EventId == ev.Id));
         await _unitOfWork.Received(1).SaveChangesAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Handle_MultipleLines_ReservesInTicketTypeIdOrder()
+    {
+        // Mọi đơn trừ vé theo cùng một thứ tự Id, để hai đơn nhiều loại vé không khoá chéo nhau.
+        var ev = GivenEvent();
+        var a = GivenTicket(ev.Id, "A");
+        var b = GivenTicket(ev.Id, "B");
+        var (first, second) = a.Id.CompareTo(b.Id) < 0 ? (a, b) : (b, a);
+        GivenTicketsInStore(a, b);
+
+        var result = await Handler().Handle(CommandFor((second, 1), (first, 2)), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Received.InOrder(() =>
+        {
+            _ticketTypes.TryReserveStockAsync(first.Id, Arg.Any<int>(), Arg.Any<CancellationToken>());
+            _ticketTypes.TryReserveStockAsync(second.Id, Arg.Any<int>(), Arg.Any<CancellationToken>());
+        });
     }
 
     // ---------- Người dùng và loại vé ----------
@@ -122,7 +157,7 @@ public sealed class PlaceOrderTests
         var result = await Handler().Handle(CommandFor((vipA, 1), (vipB, 1)), CancellationToken.None);
 
         Assert.Equal(OrderErrors.MixedEvents, result.Error);
-        Assert.Equal(10, vipA.AvailableQuantity);
+        await DidNotReserveAny();
         await _unitOfWork.DidNotReceive().SaveChangesAsync(Arg.Any<CancellationToken>());
     }
 
@@ -136,7 +171,7 @@ public sealed class PlaceOrderTests
         var result = await Handler().Handle(CommandFor((vip, 5)), CancellationToken.None);
 
         Assert.Equal(OrderErrors.ExceedsMaxPerOrder, result.Error);
-        Assert.Equal(10, vip.AvailableQuantity);
+        await DidNotReserveAny();
         await _unitOfWork.DidNotReceive().SaveChangesAsync(Arg.Any<CancellationToken>());
     }
 
@@ -166,7 +201,7 @@ public sealed class PlaceOrderTests
         var result = await Handler().Handle(CommandFor((vip, 1)), CancellationToken.None);
 
         Assert.Equal(OrderErrors.NotOnSale, result.Error);
-        Assert.Equal(10, vip.AvailableQuantity);
+        await DidNotReserveAny();
         await _unitOfWork.DidNotReceive().SaveChangesAsync(Arg.Any<CancellationToken>());
     }
 
@@ -201,13 +236,12 @@ public sealed class PlaceOrderTests
     {
         var ev = GivenEvent();
         var vip = GivenTicket(ev.Id, total: 2, maxPerOrder: 2);
-        vip.Reserve(1); // còn 1 vé, nhưng đơn xin 2
+        GivenSoldOut(vip); // UPDATE ... WHERE available_quantity >= 2 không khớp dòng nào
         GivenTicketsInStore(vip);
 
         var result = await Handler().Handle(CommandFor((vip, 2)), CancellationToken.None);
 
         Assert.Equal(TicketTypeErrors.SoldOut, result.Error);
-        Assert.Equal(1, vip.AvailableQuantity);
         _orders.DidNotReceive().Add(Arg.Any<Order>());
         await _unitOfWork.DidNotReceive().SaveChangesAsync(Arg.Any<CancellationToken>());
     }
@@ -215,11 +249,12 @@ public sealed class PlaceOrderTests
     [Fact]
     public async Task Handle_SecondLineSoldOut_DoesNotSaveFirstLine()
     {
-        // Dòng VIP đủ vé, dòng Thường hết vé: không được lưu bất kỳ dòng nào.
+        // Dòng VIP đủ vé, dòng Thường hết vé: trả SoldOut từ trong transaction để UnitOfWork rollback
+        // cả phần VIP đã trừ, và không thêm đơn.
         var ev = GivenEvent();
         var vip = GivenTicket(ev.Id, "VIP", total: 10, maxPerOrder: 4);
         var normal = GivenTicket(ev.Id, "Thường", total: 2, maxPerOrder: 2);
-        normal.Reserve(2); // hết vé
+        GivenSoldOut(normal);
         GivenTicketsInStore(vip, normal);
 
         var result = await Handler().Handle(CommandFor((vip, 2), (normal, 1)), CancellationToken.None);

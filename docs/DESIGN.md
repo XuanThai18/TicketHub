@@ -188,6 +188,7 @@ erDiagram
 | `POST /api/v1/events` | Admin, Manager | Tạo sự kiện (`Draft`) |
 | `PUT /api/v1/events/{id}` | Admin, Manager | Sửa (chỉ khi `Draft`) |
 | `POST /api/v1/events/{id}/ticket-types` | Admin, Manager | Thêm loại vé |
+| `PUT /api/v1/events/{id}/ticket-types/{ticketTypeId}` | Admin | Sửa loại vé, **kể cả khi đang bán** (gửi giá trị mới, vd tổng 200 → 300); chống ghi đè bằng `xmin` |
 | `POST /api/v1/events/{id}/publish` | Admin, Manager | Công bố (≥ 1 loại vé) |
 | `POST /api/v1/events/{id}/cancel` | Admin | Huỷ |
 | `GET /api/v1/events` | **ẩn danh** | Danh sách `Published`: phân trang, tìm theo tên, lọc theo ngày |
@@ -229,6 +230,11 @@ erDiagram
 
 3. Test bước 1 **chuyển xanh**: đúng 10 đơn thành công, 40 bị từ chối, `available_quantity = 0`.
 4. Ghi bảng so sánh (thời gian chạy, số lần retry) vào `docs/notes.md`.
+
+**Hoàn thành khi:**
+- [x] Test 50 request đỏ trên code Ticket 2 (50 đơn cho 10 vé), xanh với cả 3 cách
+- [x] Bảng so sánh A / B / C trong `notes.md`, Ticket 3 (B cần ~280 lần thử lại; B giới hạn 3 lần thì bán thiếu)
+- [x] Bản cuối dùng C: trừ vé bằng UPDATE có điều kiện trong transaction, các dòng trừ theo thứ tự `TicketTypeId`
 
 ### Ticket 4 — Thanh toán và idempotency
 
@@ -307,7 +313,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Giai đoạn 0–2: tạo dự án từ template, chạy local, đăng nhập được
 - [ ] Ticket 1 — Sự kiện + loại vé
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
-- [ ] Ticket 3 — Chống bán vượt
+- [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
 - [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
 - [ ] Ticket 5 — RabbitMQ + Outbox
 - [ ] Ticket 6 — Cache

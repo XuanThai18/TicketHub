@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -10,6 +11,7 @@ using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Events;
 using TicketHub.Application.Orders;
 using TicketHub.Domain.Common;
+using TicketHub.Domain.OrderItems;
 using TicketHub.Domain.Orders;
 using TicketHub.Infrastructure.Persistence.Contexts;
 
@@ -315,7 +317,68 @@ public sealed class OrdersEndpointsTests(ApiFactory factory)
         Assert.Equal(10, await AvailableAsync(admin, eventId, ticketId));
     }
 
+    // ---------- Chống bán vượt (Ticket 3) ----------
+
+    [Fact]
+    public async Task PlaceOrder_ConcurrentBuyers_NeverOversell()
+    {
+        // 50 người, mỗi người mua 1 vé, cùng lúc tranh 10 vé: phải đúng 10 đơn thành công, 40 bị từ chối.
+        const int total = 10;
+        const int buyers = 50;
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total, maxPerOrder: 1, publish: true);
+        var clients = Enumerable.Range(0, buyers).Select(_ => factory.CreateAuthenticatedClient(Roles.User)).ToList();
+
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var responses = await Task.WhenAll(clients.Select(c => c.PostAsJsonAsync(Orders, Lines((ticketId, 1)), Ct)));
+            stopwatch.Stop();
+
+            var created = responses.Count(r => r.StatusCode == HttpStatusCode.Created);
+            var soldOut = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
+            var failures = new List<string>();
+            foreach (var response in responses)
+            {
+                if (response.StatusCode != HttpStatusCode.Created)
+                {
+                    failures.Add($"{(int)response.StatusCode} {await CodeAsync(response)}");
+                }
+
+                response.Dispose();
+            }
+
+            var sold = await SoldAsync(ticketId);
+            var available = await AvailableAsync(admin, eventId, ticketId);
+
+            // Xem bằng: dotnet test ... --output Detailed (số liệu so sánh 3 cách nằm trong docs/notes.md, Ticket 3).
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"[oversell] {stopwatch.ElapsedMilliseconds} ms | created={created} sold={sold} available={available} | "
+                + string.Join(", ", failures.GroupBy(f => f).Select(g => $"{g.Key} x{g.Count()}")));
+
+            // So cả bộ số một lần để khi đỏ thấy đủ: bao nhiêu đơn tạo được, bao nhiêu vé bán ra, kho còn bao nhiêu.
+            Assert.Equal(
+                (Created: total, SoldOut: buyers - total, Sold: total, Available: 0),
+                (Created: created, SoldOut: soldOut, Sold: sold, Available: available));
+        }
+        finally
+        {
+            foreach (var client in clients)
+            {
+                client.Dispose();
+            }
+        }
+    }
+
     // ---------- Hàm phụ ----------
+
+    // Tổng số vé đã nằm trong đơn của một loại vé, đếm thẳng từ order_items (không tin cột available_quantity).
+    private async Task<int> SoldAsync(Guid ticketTypeId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.Set<OrderItem>().Where(i => i.TicketTypeId == ticketTypeId).SumAsync(i => i.Quantity, Ct);
+    }
 
     // Đưa hạn giữ chỗ về quá khứ để job coi là đã hết hạn (không chờ 10 phút thật).
     private async Task MakeExpiredAsync(Guid orderId)

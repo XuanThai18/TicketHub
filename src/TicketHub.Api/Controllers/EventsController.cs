@@ -80,6 +80,18 @@ public sealed class EventsController(ISender sender) : BaseApiController
         return CreatedOrProblem(result, _ => $"/api/v1/events/{id}");
     }
 
+    [HttpPut("{id:guid}/ticket-types/{ticketTypeId:guid}")]
+    [Authorize(Policy = Policies.RequireAdminRole)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> UpdateTicketType(
+        Guid id, Guid ticketTypeId, UpdateTicketTypeRequest request, CancellationToken cancellationToken) =>
+        HandleResult(await sender.Send(new UpdateTicketTypeCommand(
+            id, ticketTypeId, request.Name, request.Description,
+            request.Price, request.TotalQuantity, request.MaxQuantityPerOrder), cancellationToken));
+
     [HttpGet]
     [AllowAnonymous]
     public async Task<IActionResult> ListEvents([FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 10, CancellationToken cancellationToken = default)
