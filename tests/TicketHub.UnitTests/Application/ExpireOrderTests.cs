@@ -35,14 +35,9 @@ public sealed class ExpireOrderTests
     private static TicketType GivenTicket(string name = "VIP", int total = 10, int maxPerOrder = 4) =>
         TicketType.Create(_eventId, name, null, 500_000m, total, maxPerOrder).Value;
 
-    // Trừ vé trước rồi dựng đơn Pending; chỉ để có Items, số vé thật nằm ở DB.
+    // Đơn Pending chỉ để có Items; số vé thật nằm ở DB.
     private static Order GivenPendingOrder(params (TicketType Ticket, int Quantity)[] lines)
     {
-        foreach (var (ticket, quantity) in lines)
-        {
-            Assert.True(ticket.Reserve(quantity).IsSuccess);
-        }
-
         return Order.Create(Guid.NewGuid(), lines.ToList(), _now).Value;
     }
 

@@ -19,9 +19,6 @@ public static class TicketTypeErrors
 
     public static Error DuplicateName(string name) => Error.Conflict(
         "TicketTypes.DuplicateName", $"A ticket type named '{name}' already exists in this event.");
-    public static readonly Error InvalidReserveQuantity = Error.Validation(
-    "TicketTypes.InvalidReserveQuantity", "Reserved quantity must be greater than 0.");
-
     public static readonly Error SoldOut = Error.Conflict(
         "TicketTypes.SoldOut", "Not enough tickets available.");
 }

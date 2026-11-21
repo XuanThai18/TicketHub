@@ -13,6 +13,15 @@ internal sealed class TicketTypeRepository(ApplicationDbContext dbContext) : ITi
     {
         return await dbContext.Set<TicketType>().Where(tt => ids.Contains(tt.Id)).ToListAsync(cancellationToken);
     }
+    // Kiểm "còn đủ vé" và trừ nằm trong cùng một câu: request thứ hai chờ dòng được nhả rồi kiểm lại WHERE trên số mới.
+    public async Task<bool> TryReserveStockAsync(Guid id, int quantity, CancellationToken cancellationToken)
+    {
+        var rows = await dbContext.Set<TicketType>()
+            .Where(tt => tt.Id == id && tt.AvailableQuantity >= quantity)
+            .ExecuteUpdateAsync(s => s.SetProperty(tt => tt.AvailableQuantity, tt => tt.AvailableQuantity - quantity), cancellationToken);
+        return rows == 1;
+    }
+
     public async Task<bool> TryReturnStockAsync(Guid id, int quantity, CancellationToken cancellationToken)
     {
         var rows = await dbContext.Set<TicketType>()

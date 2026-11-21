@@ -80,21 +80,28 @@ public sealed class PlaceOrderCommandHandler(
             return OrderErrors.NotOnSale;
         }
 
-        // 4. Trừ vé từng dòng. Nếu một dòng không đủ, dừng ngay:
-        //    đơn chưa được thêm và chưa SaveChanges, nên DB không thay đổi.
-        foreach (var (ticketType, quantity) in lines)
+        // 4. Trừ vé bằng UPDATE có điều kiện rồi lưu đơn, tất cả trong một transaction.
+        //    Một dòng hết vé thì rollback cả những dòng đã trừ. Sắp theo Id để hai đơn nhiều loại vé
+        //    luôn khoá dòng theo cùng thứ tự, không khoá chéo nhau (deadlock).
+        var reservations = lines
+            .Select(l => (TicketTypeId: l.TicketType.Id, l.Quantity))
+            .OrderBy(l => l.TicketTypeId)
+            .ToList();
+
+        return await unitOfWork.ExecuteInTransactionAsync<Result<Guid>>(async ct =>
         {
-            var reserved = ticketType.Reserve(quantity);
-            if (reserved.IsFailure)
+            foreach (var (ticketTypeId, quantity) in reservations)
             {
-                return reserved.Error;
+                if (!await ticketTypeRepository.TryReserveStockAsync(ticketTypeId, quantity, ct))
+                {
+                    return TicketTypeErrors.SoldOut;
+                }
             }
-        }
 
-        // 5. Thêm đơn và lưu một lần: vé trừ và đơn tạo cùng thành công hoặc cùng thất bại.
-        orderRepository.Add(order);
-        await unitOfWork.SaveChangesAsync(cancellationToken);
-
-        return order.Id;
+            // Add nằm trong delegate: nếu transaction chạy lại, tracker đã bị xoá nên phải thêm đơn lần nữa.
+            orderRepository.Add(order);
+            await unitOfWork.SaveChangesAsync(ct);
+            return order.Id;
+        }, cancellationToken: cancellationToken);
     }
 }

@@ -230,6 +230,12 @@ erDiagram
 3. Test bước 1 **chuyển xanh**: đúng 10 đơn thành công, 40 bị từ chối, `available_quantity = 0`.
 4. Ghi bảng so sánh (thời gian chạy, số lần retry) vào `docs/notes.md`.
 
+**Hoàn thành khi:**
+- [x] Test 50 request đỏ trên code Ticket 2 (50 đơn cho 10 vé), xanh với cả 3 cách
+- [x] Bảng so sánh A / B / C trong `notes.md`, Ticket 3 (B cần ~280 lần thử lại; B giới hạn 3 lần thì bán thiếu)
+- [x] Bản cuối dùng C: trừ vé bằng UPDATE có điều kiện trong transaction, các dòng trừ theo thứ tự `TicketTypeId`
+- [ ] `TicketType.Update` của admin vẫn có lost update — dự định dùng `xmin` (cách B)
+
 ### Ticket 4 — Thanh toán và idempotency
 
 | Endpoint | Việc |
@@ -307,7 +313,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Giai đoạn 0–2: tạo dự án từ template, chạy local, đăng nhập được
 - [ ] Ticket 1 — Sự kiện + loại vé
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
-- [ ] Ticket 3 — Chống bán vượt
+- [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
 - [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
 - [ ] Ticket 5 — RabbitMQ + Outbox
 - [ ] Ticket 6 — Cache

@@ -110,12 +110,12 @@ query = query.Where(e => e.Name.ToLower().Contains(search));   // EF dịch thà
 - **Vì sao trừ ngay:** người đã đặt chắc chắn còn vé trong lúc đi thanh toán. Cái giá là vé bị giữ bởi người bỏ ngang, nên phải có job trả vé khi hết hạn (mục 6).
 - Sự kiện phải `Published` và đang trong khung `[SaleStartsAt, SaleEndsAt)`, sai thì `Orders.NotOnSale` (409).
 
-### 3. `PlaceOrder` hiện là bản đơn giản và sẽ bán vượt
+### 3. `PlaceOrder` bản đầu là bản đơn giản và bán vượt *(đã sửa ở Ticket 3)*
 
-Luồng hiện tại: đọc loại vé → `Reserve` trừ trong bộ nhớ → `SaveChanges`.
+Luồng của Ticket 2: đọc loại vé → `Reserve` trừ trong bộ nhớ → `SaveChanges`.
 
 - `SaveChanges` tự mở một transaction ngầm, nên đơn và số vé cùng lưu hoặc cùng không. Nhưng transaction đó **không** chặn được hai request cùng đọc `available = 1`, cùng trừ, cùng lưu: lần ghi sau đè lần ghi trước (lost update) và vé bị bán quá.
-- **Cố ý để vậy:** Ticket 3 viết test chứng minh lỗi rồi so sánh ba cách sửa.
+- **Cố ý để vậy:** Ticket 3 viết test chứng minh lỗi rồi so sánh ba cách sửa. Xem phần Ticket 3 bên dưới.
 
 ### 4. Huỷ đơn: UPDATE có điều kiện, không đọc rồi mới ghi
 
@@ -178,3 +178,54 @@ OrderExpiryService (BackgroundService, PeriodicTimer 30s)
   - `Cancel_ConcurrentRequests_...` bắn hai request huỷ cùng lúc bằng `Task.WhenAll`: đúng một 204, một 409, kho chỉ cộng một lần.
   - Test hết hạn đẩy `expires_at` về quá khứ bằng SQL thay vì thay `TimeProvider` của cả app. Đồng hồ giả dùng chung sẽ ảnh hưởng cả JWT và phiên đăng nhập của các test khác.
 - **Bẫy:** `HttpStatusCode` sắp theo số (204 < 409). Assert danh sách mã trạng thái sau `OrderBy` phải viết `[NoContent, Conflict]`.
+
+---
+
+## Ticket 3: Chống bán vượt
+
+### 1. Chứng minh lỗi trước
+
+Test `PlaceOrder_ConcurrentBuyers_NeverOversell`: một loại vé có 10 vé, 50 user khác nhau cùng lúc mỗi người đặt 1 vé (`Task.WhenAll`). Test so một lúc bốn số: đơn tạo được, đơn bị từ chối, vé thật sự đã bán (đếm thẳng `order_items`, không tin cột `available_quantity`), vé còn lại.
+
+Trên code Ticket 2, test đỏ cả 3 lần chạy: **50/50 đơn được tạo, 50 vé bán ra, kho vẫn còn 8–9**.
+
+- Hầu hết request đọc được `available = 10` trước khi ai kịp lưu, cùng trừ thành 9 rồi ghi đè lên nhau. Bán 50 mà kho chỉ giảm 1–2.
+- `CHECK (available_quantity >= 0)` không chặn được: không request nào ghi số âm. Ràng buộc chỉ bắt được lỗi trừ quá tay, không bắt được ghi đè.
+
+### 2. Ba cách sửa và số liệu
+
+Mỗi cách một nhánh thử nghiệm, giữ lại để đối chiếu (không merge): `ticket-3a-pessimistic`, `ticket-3b-optimistic`, `ticket-3c-atomic`.
+
+| Cách | Làm thế nào | Kết quả (10 vé, 50 người, 5 lần chạy) | Thời gian 50 request |
+|---|---|---|---|
+| Chưa sửa | Đọc → trừ trong bộ nhớ → lưu | **Sai:** 50 đơn, kho còn 8–9 | 680–780 ms |
+| **A. Khoá bi quan** | Cả luồng trong một transaction; `SELECT ... FOR UPDATE` loại vé, sắp theo `id` | Đúng: 10 đơn, 40 `SoldOut` | 630–780 ms |
+| **B. Khoá lạc quan** | `xmin` làm concurrency token; xung đột thì chạy lại cả transaction, tối đa 10 lần, hết lượt trả 409 `Orders.Busy` | Đúng: 10 đơn, 40 `SoldOut`, nhưng **257–310 lần thử lại** | 1.070–1.200 ms |
+| B, giới hạn 3 lần | Như trên | **Bán thiếu:** chỉ 4–6 đơn, kho còn 4–6, 44–46 người nhận `Orders.Busy` dù còn vé | 800–940 ms |
+| **C. UPDATE nguyên tử** | `UPDATE ... SET available = available - @q WHERE id = @id AND available >= @q`, 0 dòng = hết vé | Đúng: 10 đơn, 40 `SoldOut`, 0 lần thử lại | 570–800 ms |
+
+**Cách đọc số liệu:**
+- Cả 50 request chạy qua `TestServer` trong cùng một process, nên phần lớn thời gian là chi phí HTTP và tạo đơn. Vì vậy A và C chênh nhau không rõ ở quy mô này. Khác biệt thật về thời gian chờ khoá sẽ đo bằng k6 ở Ticket 7.
+- Con số nói lên nhiều nhất là **số lần thử lại của B**. Mỗi vé bán ra kéo theo khoảng 27 lần làm lại cả transaction: đọc, kiểm, ghi, rồi bị từ chối. Tranh chấp càng cao thì số lần thử lại càng tăng.
+- Giới hạn số lần thử lại của B là một lựa chọn khó. Giới hạn thấp thì từ chối oan người mua khi vẫn còn vé (bán thiếu, cũng là lỗi nghiệp vụ). Giới hạn cao thì request treo lâu và tốn DB.
+
+### 3. Chọn C
+
+- Kiểm tra và trừ nằm trong một câu lệnh, nên không còn khoảng trống giữa đọc và ghi. Postgres khoá dòng trong lúc UPDATE, request sau chờ rồi kiểm lại `WHERE` trên số mới (`READ COMMITTED`).
+- Không đọc dòng lên C# để trừ, không thử lại, khoá giữ ngắn nhất. Cùng kiểu với huỷ đơn và hết hạn đơn ở Ticket 2, nên code nhất quán.
+- **Đơn nhiều loại vé:** mỗi dòng một UPDATE, tất cả trong một transaction (`ExecuteInTransactionAsync`). Một dòng hết vé thì trả `SoldOut` từ trong transaction, UnitOfWork rollback cả các dòng đã trừ. Các dòng được trừ **theo thứ tự `TicketTypeId`** để hai đơn cùng chứa VIP và Thường luôn khoá theo một thứ tự, không khoá chéo nhau (deadlock).
+- `orderRepository.Add(order)` nằm **trong** delegate của transaction: execution strategy chạy lại thì tracker bị xoá, đơn phải được thêm lại.
+- **Đánh đổi:** luật "không trừ quá số còn" chuyển từ `TicketType.Reserve` xuống SQL, nên `Reserve` và test của nó bị xoá (giống `Cancel`, `Expire` ở Ticket 2). Luật được chứng minh bằng integration test trên Postgres thật.
+
+### 4. Khi nào dùng A hoặc B
+
+| Cách | Hợp khi |
+|---|---|
+| A. Khoá bi quan | Phải đọc dữ liệu lên, chạy logic phức tạp trong C# rồi mới ghi, và logic đó không viết gọn được thành một câu SQL. Khoá nhiều dòng thì luôn khoá theo một thứ tự cố định. |
+| B. Khoá lạc quan | Ít tranh chấp, ví dụ admin sửa thông tin, và muốn giữ luật trong entity. Xung đột hiếm nên thử lại rẻ. |
+
+### 5. Việc còn để ngỏ
+
+- **`TicketType.Update` (admin sửa tổng số vé) vẫn bị lost update:** nó đọc `AvailableQuantity`, tính lại rồi ghi đè. Nếu admin lưu đúng lúc có người đang mua, phần vé vừa bị trừ có thể bị ghi đè mất. Chỗ này ít tranh chấp, nên cách hợp là B (`xmin`). Mẫu cấu hình nằm ở nhánh `ticket-3b-optimistic`.
+- Migration cho `xmin` sinh ra `AddColumn("xmin")` nhưng Npgsql bỏ qua cột hệ thống khi tạo SQL, nên không có cột mới nào được tạo. Module Auth cũng dựa vào hành vi này.
+- Xem số liệu của test: `dotnet test tests/TicketHub.IntegrationTests --filter-method "*NeverOversell" --output Detailed`, rồi tìm dòng `[oversell]`.

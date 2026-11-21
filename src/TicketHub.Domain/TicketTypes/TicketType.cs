@@ -71,18 +71,6 @@ public sealed class TicketType : Entity
         return Result.Success();
     }
 
-    public Result Reserve(int quantity)
-    {
-        if (quantity <= 0)
-            return TicketTypeErrors.InvalidReserveQuantity;
-
-        if (AvailableQuantity < quantity)
-            return TicketTypeErrors.SoldOut;
-
-        AvailableQuantity -= quantity;
-        return Result.Success();
-    }
-
     private static Error? Validate(decimal price, int totalQuantity, int maxQuantityPerOrder)
     {
         if (price < 0) return TicketTypeErrors.InvalidPrice;
