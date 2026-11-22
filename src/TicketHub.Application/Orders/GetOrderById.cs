@@ -6,6 +6,7 @@ using TicketHub.Domain.Events;
 using TicketHub.Domain.OrderItems;
 using TicketHub.Domain.Orders;
 using TicketHub.Domain.Shared;
+using TicketHub.Domain.Tickets;
 using TicketHub.Domain.TicketTypes;
 
 namespace TicketHub.Application.Orders;
@@ -21,7 +22,11 @@ public sealed record OrderDetailResponse(
     DateTimeOffset CreatedAt,
     DateTimeOffset ExpiresAt,
     DateTimeOffset? PaidAt,
-    IReadOnlyList<OrderItemResponse> Items);
+    IReadOnlyList<OrderItemResponse> Items,
+    IReadOnlyList<OrderTicketResponse> Tickets);
+
+/// <summary>Vé đã phát cho đơn; rỗng khi đơn chưa thanh toán.</summary>
+public sealed record OrderTicketResponse(Guid Id, string Code, Guid TicketTypeId, string Status, DateTimeOffset IssuedAt);
 
 public sealed record OrderItemResponse(
     Guid TicketTypeId,
@@ -78,6 +83,12 @@ public sealed class GetOrderByIdQueryHandler(IReadDbContext readDbContext, ICurr
                 i.Quantity * i.UnitPrice))
             .ToListAsync(cancellationToken);
 
+        var tickets = await readDbContext.Query<Ticket>()
+            .Where(t => t.OrderId == request.Id)
+            .OrderBy(t => t.Id)
+            .Select(t => new OrderTicketResponse(t.Id, t.Code, t.TicketTypeId, t.Status.ToString(), t.IssuedAt))
+            .ToListAsync(cancellationToken);
+
         return new OrderDetailResponse(
             order.Id,
             order.Code,
@@ -89,6 +100,7 @@ public sealed class GetOrderByIdQueryHandler(IReadDbContext readDbContext, ICurr
             order.CreatedAt,
             order.ExpiresAt,
             order.PaidAt,
-            items);
+            items,
+            tickets);
     }
 }

@@ -26,6 +26,14 @@ public static class OrderErrors
     public static readonly Error NotExpirable = Error.Conflict(
         "Orders.NotExpirable", "Only pending orders that have passed their expiry time can expire.");
 
+    public static readonly Error NotPayable = Error.Conflict(
+        "Orders.NotPayable", "Only pending orders that have not expired can be paid.");
+
     public static Error NotFound(Guid id) => Error.NotFound(
         "Orders.NotFound", $"Order '{id}' was not found.");
+
+    // 422 theo bản nháp IETF "Idempotency-Key HTTP Header Field": cùng key nhưng nội dung yêu cầu khác.
+    public static readonly Error IdempotencyKeyReused = Error.Unprocessable(
+        "Orders.IdempotencyKeyReused",
+        "This Idempotency-Key was already used for a different order. Generate a new key for a new purchase.");
 }

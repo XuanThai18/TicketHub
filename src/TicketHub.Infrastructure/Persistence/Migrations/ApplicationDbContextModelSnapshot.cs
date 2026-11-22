@@ -257,6 +257,98 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         });
                 });
 
+            modelBuilder.Entity("TicketHub.Domain.Payments.Payment", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<decimal>("Amount")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)")
+                        .HasColumnName("amount");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("completed_at");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("created_by");
+
+                    b.Property<DateTimeOffset?>("DeletedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("deleted_at");
+
+                    b.Property<string>("DeletedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("deleted_by");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_deleted");
+
+                    b.Property<Guid>("OrderId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("order_id");
+
+                    b.Property<string>("Provider")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("character varying(30)")
+                        .HasColumnName("provider");
+
+                    b.Property<string>("ProviderTransactionId")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)")
+                        .HasColumnName("provider_transaction_id");
+
+                    b.Property<string>("RawPayload")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("raw_payload");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)")
+                        .HasColumnName("status");
+
+                    b.Property<DateTimeOffset?>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Id")
+                        .HasName("pk_payments");
+
+                    b.HasIndex("OrderId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_payments_order_id_pending")
+                        .HasFilter("status = 'Pending'");
+
+                    b.HasIndex("ProviderTransactionId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_payments_provider_transaction_id");
+
+                    b.ToTable("payments", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_payments_amount", "amount >= 0");
+
+                            t.HasCheckConstraint("ck_payments_completed_at", "(status = 'Pending') = (completed_at IS NULL)");
+
+                            t.HasCheckConstraint("ck_payments_status", "status IN('Pending', 'Succeeded', 'Failed', 'RefundRequired')");
+                        });
+                });
+
             modelBuilder.Entity("TicketHub.Domain.TicketTypes.TicketType", b =>
                 {
                     b.Property<Guid>("Id")
@@ -349,6 +441,84 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         });
                 });
 
+            modelBuilder.Entity("TicketHub.Domain.Tickets.Ticket", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<string>("Code")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("code");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("created_by");
+
+                    b.Property<DateTimeOffset?>("DeletedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("deleted_at");
+
+                    b.Property<string>("DeletedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("deleted_by");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_deleted");
+
+                    b.Property<DateTimeOffset>("IssuedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("issued_at");
+
+                    b.Property<Guid>("OrderId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("order_id");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)")
+                        .HasColumnName("status");
+
+                    b.Property<Guid>("TicketTypeId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("ticket_type_id");
+
+                    b.Property<DateTimeOffset?>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Id")
+                        .HasName("pk_tickets");
+
+                    b.HasIndex("Code")
+                        .IsUnique()
+                        .HasDatabaseName("ix_tickets_code");
+
+                    b.HasIndex("OrderId")
+                        .HasDatabaseName("ix_tickets_order_id");
+
+                    b.HasIndex("TicketTypeId")
+                        .HasDatabaseName("ix_tickets_ticket_type_id");
+
+                    b.ToTable("tickets", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_tickets_status", "status IN('Valid', 'Used', 'Cancelled')");
+                        });
+                });
+
             modelBuilder.Entity("TicketHub.Domain.OrderItems.OrderItem", b =>
                 {
                     b.HasOne("TicketHub.Domain.Orders.Order", null)
@@ -376,6 +546,16 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         .HasConstraintName("fk_orders_events_event_id");
                 });
 
+            modelBuilder.Entity("TicketHub.Domain.Payments.Payment", b =>
+                {
+                    b.HasOne("TicketHub.Domain.Orders.Order", null)
+                        .WithMany()
+                        .HasForeignKey("OrderId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_payments_orders_order_id");
+                });
+
             modelBuilder.Entity("TicketHub.Domain.TicketTypes.TicketType", b =>
                 {
                     b.HasOne("TicketHub.Domain.Events.Event", null)
@@ -384,6 +564,23 @@ namespace TicketHub.Infrastructure.Persistence.Migrations
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired()
                         .HasConstraintName("fk_ticket_types_events_event_id");
+                });
+
+            modelBuilder.Entity("TicketHub.Domain.Tickets.Ticket", b =>
+                {
+                    b.HasOne("TicketHub.Domain.Orders.Order", null)
+                        .WithMany()
+                        .HasForeignKey("OrderId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_tickets_orders_order_id");
+
+                    b.HasOne("TicketHub.Domain.TicketTypes.TicketType", null)
+                        .WithMany()
+                        .HasForeignKey("TicketTypeId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_tickets_ticket_type_ticket_type_id");
                 });
 
             modelBuilder.Entity("TicketHub.Domain.Orders.Order", b =>

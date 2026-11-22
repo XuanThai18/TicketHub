@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using TicketHub.Application.Abstractions;
+using TicketHub.Application.Payments;
 using TicketHub.Infrastructure.Auth;
 using TicketHub.Infrastructure.Orders;
 using TicketHub.Infrastructure.Persistence;
@@ -47,6 +48,12 @@ public static class DependencyInjection
         services.AddRepositories();
         services.AddAuthModule();
         services.AddHostedService<OrderExpiryService>();
+
+        // Thiếu khoá webhook (hoặc khoá ngắn) thì app không khởi động, thay vì chạy rồi mới từ chối mọi webhook.
+        services.AddOptions<PaymentOptions>()
+            .BindConfiguration(PaymentOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
 
         services.AddStackExchangeRedisCache(options =>
         {

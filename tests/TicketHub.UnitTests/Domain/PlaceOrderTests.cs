@@ -1,6 +1,7 @@
 using System.Data;
 using NSubstitute;
 using TicketHub.Application.Abstractions;
+using TicketHub.Application.Common.Exceptions;
 using TicketHub.Application.Orders;
 using TicketHub.Domain.Events;
 using TicketHub.Domain.Orders;
@@ -26,8 +27,8 @@ public sealed class PlaceOrderTests
 
         // Transaction chạy thẳng delegate, để test thấy kết quả của bên trong.
         _unitOfWork.ExecuteInTransactionAsync(
-                Arg.Any<Func<CancellationToken, Task<Result<Guid>>>>(), Arg.Any<IsolationLevel>(), Arg.Any<CancellationToken>())
-            .Returns(ci => ci.ArgAt<Func<CancellationToken, Task<Result<Guid>>>>(0)(CancellationToken.None));
+                Arg.Any<Func<CancellationToken, Task<Result<PlaceOrderResult>>>>(), Arg.Any<IsolationLevel>(), Arg.Any<CancellationToken>())
+            .Returns(ci => ci.ArgAt<Func<CancellationToken, Task<Result<PlaceOrderResult>>>>(0)(CancellationToken.None));
 
         // Mặc định: còn đủ vé.
         _ticketTypes.TryReserveStockAsync(Arg.Any<Guid>(), Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(true);
@@ -89,7 +90,7 @@ public sealed class PlaceOrderTests
         Assert.True(result.IsSuccess);
         await _ticketTypes.Received(1).TryReserveStockAsync(vip.Id, 2, Arg.Any<CancellationToken>());
         _orders.Received(1).Add(Arg.Is<Order>(o =>
-            o.Id == result.Value && o.UserId == _userId && o.EventId == ev.Id));
+            o.Id == result.Value.OrderId && o.UserId == _userId && o.EventId == ev.Id));
         await _unitOfWork.Received(1).SaveChangesAsync(Arg.Any<CancellationToken>());
     }
 
@@ -262,6 +263,109 @@ public sealed class PlaceOrderTests
         Assert.Equal(TicketTypeErrors.SoldOut, result.Error);
         _orders.DidNotReceive().Add(Arg.Any<Order>());
         await _unitOfWork.DidNotReceive().SaveChangesAsync(Arg.Any<CancellationToken>());
+    }
+
+    // ---------- Idempotency-Key ----------
+
+    private const string Key = "retry-key-1";
+
+    // Đơn đã có sẵn trong DB với Key này (lần đặt trước).
+    private Order GivenOrderWithKey(TicketType ticket, int quantity)
+    {
+        var existing = Order.Create(_userId, [(ticket, quantity)], _now, Key).Value;
+        _orders.GetByIdempotencyKeyAsync(_userId, Key, Arg.Any<CancellationToken>()).Returns(existing);
+        return existing;
+    }
+
+    [Fact]
+    public async Task Handle_NewKey_StoresKeyOnOrder()
+    {
+        var ev = GivenEvent();
+        var vip = GivenTicket(ev.Id);
+        GivenTicketsInStore(vip);
+
+        var result = await Handler().Handle(CommandFor((vip, 2)) with { IdempotencyKey = Key }, CancellationToken.None);
+
+        Assert.False(result.Value.Replayed);
+        _orders.Received(1).Add(Arg.Is<Order>(o => o.IdempotencyKey == Key));
+    }
+
+    [Fact]
+    public async Task Handle_KeyUsedWithSameLines_ReplaysWithoutReservingOrSaving()
+    {
+        var ev = GivenEvent();
+        var vip = GivenTicket(ev.Id);
+        var existing = GivenOrderWithKey(vip, 2);
+
+        var result = await Handler().Handle(CommandFor((vip, 2)) with { IdempotencyKey = Key }, CancellationToken.None);
+
+        Assert.Equal(new PlaceOrderResult(existing.Id, Replayed: true), result.Value);
+        await DidNotReserveAny();
+        _orders.DidNotReceive().Add(Arg.Any<Order>());
+    }
+
+    [Fact]
+    public async Task Handle_KeyUsedWithDifferentLines_ReturnsKeyReused()
+    {
+        var ev = GivenEvent();
+        var vip = GivenTicket(ev.Id);
+        GivenOrderWithKey(vip, 2);
+
+        var result = await Handler().Handle(CommandFor((vip, 3)) with { IdempotencyKey = Key }, CancellationToken.None);
+
+        Assert.Equal(OrderErrors.IdempotencyKeyReused, result.Error);
+        await DidNotReserveAny();
+    }
+
+    [Fact]
+    public async Task Handle_KeyInsertedByConcurrentRequest_ReturnsThatOrderAsReplay()
+    {
+        // Lúc kiểm thì chưa có đơn; lúc lưu thì request kia đã commit trước → unique index báo trùng.
+        var ev = GivenEvent();
+        var vip = GivenTicket(ev.Id);
+        GivenTicketsInStore(vip);
+        var winner = Order.Create(_userId, [(vip, 2)], _now, Key).Value;
+        _orders.GetByIdempotencyKeyAsync(_userId, Key, Arg.Any<CancellationToken>()).Returns(null, winner);
+        _unitOfWork.SaveChangesAsync(Arg.Any<CancellationToken>()).Returns(Task.FromException<int>(
+            new UniqueConstraintException("duplicate") { ConstraintName = PlaceOrderCommandHandler.IdempotencyKeyIndex }));
+
+        var result = await Handler().Handle(CommandFor((vip, 2)) with { IdempotencyKey = Key }, CancellationToken.None);
+
+        Assert.Equal(new PlaceOrderResult(winner.Id, Replayed: true), result.Value);
+    }
+
+    [Fact]
+    public async Task Handle_OtherUniqueViolation_IsNotTreatedAsReplay()
+    {
+        // Trùng một unique index khác (vd mã đơn) không phải chuyện gửi lặp: để exception đi lên.
+        var ev = GivenEvent();
+        var vip = GivenTicket(ev.Id);
+        GivenTicketsInStore(vip);
+        _unitOfWork.SaveChangesAsync(Arg.Any<CancellationToken>()).Returns(Task.FromException<int>(
+            new UniqueConstraintException("duplicate") { ConstraintName = "ix_orders_code" }));
+
+        await Assert.ThrowsAsync<UniqueConstraintException>(() =>
+            Handler().Handle(CommandFor((vip, 2)) with { IdempotencyKey = Key }, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Validator_BlankKey_Fails(string key)
+    {
+        var result = new PlaceOrderCommandValidator().Validate(
+            new PlaceOrderCommand([new PlaceOrderLine(Guid.NewGuid(), 1)], key));
+
+        Assert.False(result.IsValid);
+    }
+
+    [Fact]
+    public void Validator_KeyLongerThanColumn_Fails()
+    {
+        var result = new PlaceOrderCommandValidator().Validate(
+            new PlaceOrderCommand([new PlaceOrderLine(Guid.NewGuid(), 1)], new string('k', Order.IdempotencyKeyMaxLength + 1)));
+
+        Assert.False(result.IsValid);
     }
 
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider

@@ -370,7 +370,153 @@ public sealed class OrdersEndpointsTests(ApiFactory factory)
         }
     }
 
+    // ---------- Idempotency-Key (Ticket 4.1) ----------
+
+    [Fact]
+    public async Task PlaceOrder_SameKeyConcurrently_CreatesExactlyOneOrder()
+    {
+        // App tự gửi lại 20 lần cùng một key gần như cùng lúc: chỉ được có một đơn, trừ vé một lần,
+        // và mọi request đều nhận lại đúng đơn đó.
+        const int retries = 20;
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        var userId = Guid.NewGuid();
+        using var user = factory.CreateAuthenticatedClient(userId, Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var key = Guid.NewGuid().ToString();
+
+        var responses = await Task.WhenAll(Enumerable.Range(0, retries)
+            .Select(_ => PostWithKeyAsync(user, key, (ticketId, 2))));
+
+        try
+        {
+            var statuses = responses.Select(r => r.StatusCode).Distinct().ToList();
+            var ids = new HashSet<Guid>();
+            foreach (var response in responses.Where(r => r.StatusCode == HttpStatusCode.Created))
+            {
+                ids.Add((await response.Content.ReadFromJsonAsync<CreatedResponse>(Ct))!.Id);
+            }
+
+            Assert.Equal(
+                (Statuses: "Created", DistinctIds: 1, OrdersInDb: 1, Available: 8),
+                (Statuses: string.Join(",", statuses), DistinctIds: ids.Count, OrdersInDb: await OrderCountAsync(userId), Available: await AvailableAsync(admin, eventId, ticketId)));
+        }
+        finally
+        {
+            foreach (var response in responses)
+            {
+                response.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task PlaceOrder_SameKeyTwice_ReplaysFirstOrder()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        var userId = Guid.NewGuid();
+        using var user = factory.CreateAuthenticatedClient(userId, Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(user, key, (ticketId, 2));
+        using var second = await PostWithKeyAsync(user, key, (ticketId, 2));
+
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        Assert.False(first.Headers.Contains("Idempotent-Replayed"));
+        Assert.Equal("true", second.Headers.GetValues("Idempotent-Replayed").Single());
+        Assert.Equal(first.Headers.Location, second.Headers.Location);
+        Assert.Equal(
+            (await first.Content.ReadFromJsonAsync<CreatedResponse>(Ct))!.Id,
+            (await second.Content.ReadFromJsonAsync<CreatedResponse>(Ct))!.Id);
+        Assert.Equal(1, await OrderCountAsync(userId));
+        Assert.Equal(8, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Fact]
+    public async Task PlaceOrder_SameKeyDifferentLines_Returns422AndKeepsStock()
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var key = Guid.NewGuid().ToString();
+        (await PostWithKeyAsync(user, key, (ticketId, 2))).Dispose();
+
+        using var reused = await PostWithKeyAsync(user, key, (ticketId, 3));
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, reused.StatusCode);
+        Assert.Equal("Orders.IdempotencyKeyReused", await CodeAsync(reused));
+        Assert.Equal(8, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Fact]
+    public async Task PlaceOrder_SameKeyFromTwoUsers_CreatesTwoOrders()
+    {
+        // Key chỉ có phạm vi trong từng user: hai người tình cờ sinh trùng key vẫn là hai đơn riêng.
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var alice = factory.CreateAuthenticatedClient(Roles.User);
+        using var bob = factory.CreateAuthenticatedClient(Roles.User);
+        var (eventId, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var key = Guid.NewGuid().ToString();
+
+        using var fromAlice = await PostWithKeyAsync(alice, key, (ticketId, 1));
+        using var fromBob = await PostWithKeyAsync(bob, key, (ticketId, 1));
+
+        Assert.Equal((HttpStatusCode.Created, HttpStatusCode.Created), (fromAlice.StatusCode, fromBob.StatusCode));
+        Assert.False(fromBob.Headers.Contains("Idempotent-Replayed"));
+        Assert.Equal(8, await AvailableAsync(admin, eventId, ticketId));
+    }
+
+    [Theory]
+    [InlineData(101)]
+    [InlineData(0)]
+    public async Task PlaceOrder_InvalidKey_Returns400(int length)
+    {
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (_, ticketId) = await CreateEventAsync(admin, total: 10, maxPerOrder: 4, publish: true);
+        var key = length == 0 ? "   " : new string('k', length);
+
+        using var response = await PostWithKeyAsync(user, key, (ticketId, 1));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PlaceOrder_KeyAfterFailedAttempt_RunsAgain()
+    {
+        // Lần đầu hết vé thì không lưu gì: gửi lại cùng key sau khi có người huỷ đơn phải đặt được.
+        using var admin = factory.CreateAuthenticatedClient(Roles.Admin);
+        using var holder = factory.CreateAuthenticatedClient(Roles.User);
+        using var user = factory.CreateAuthenticatedClient(Roles.User);
+        var (_, ticketId) = await CreateEventAsync(admin, total: 2, maxPerOrder: 2, publish: true);
+        var held = await PlaceOrderAsync(holder, (ticketId, 2)); // bán hết
+        var key = Guid.NewGuid().ToString();
+
+        using var soldOut = await PostWithKeyAsync(user, key, (ticketId, 1));
+        (await holder.PostAsync($"{Orders}/{held}/cancel", null, Ct)).Dispose(); // trả 2 vé về kho
+        using var retried = await PostWithKeyAsync(user, key, (ticketId, 1));
+
+        Assert.Equal(HttpStatusCode.Conflict, soldOut.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, retried.StatusCode);
+        Assert.False(retried.Headers.Contains("Idempotent-Replayed"));
+    }
+
     // ---------- Hàm phụ ----------
+
+    private static Task<HttpResponseMessage> PostWithKeyAsync(HttpClient client, string key, params (Guid TicketTypeId, int Quantity)[] lines)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, Orders) { Content = JsonContent.Create(Lines(lines)) };
+        request.Headers.Add("Idempotency-Key", key);
+        return client.SendAsync(request, Ct);
+    }
+
+    private async Task<int> OrderCountAsync(Guid userId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.Set<Order>().CountAsync(o => o.UserId == userId, Ct);
+    }
 
     // Tổng số vé đã nằm trong đơn của một loại vé, đếm thẳng từ order_items (không tin cột available_quantity).
     private async Task<int> SoldAsync(Guid ticketTypeId)

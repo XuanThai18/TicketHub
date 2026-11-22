@@ -16,6 +16,9 @@ namespace TicketHub.IntegrationTests;
 /// </summary>
 public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
+    /// <summary>Khoá ký webhook thanh toán trong test; test tự ký webhook bằng khoá này để giả làm cổng.</summary>
+    public const string WebhookSecret = "integration-test-webhook-secret-0123456789";
+
     private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder("postgres:16-alpine").Build();
     private readonly RedisContainer _redis = new RedisBuilder("redis:7-alpine").Build();
 
@@ -54,6 +57,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseSetting("ConnectionStrings:DefaultConnection", _postgres.GetConnectionString());
         builder.UseSetting("ConnectionStrings:Redis", _redis.GetConnectionString());
         builder.UseSetting("JwtSettings:Secret", "integration-test-secret-0123456789abcdef");
+        builder.UseSetting("Payments:WebhookSecret", WebhookSecret);
         builder.UseSetting("Database:MigrateOnStartup", "true");
         builder.UseSetting("RateLimiting:PermitLimit", "100000");
         builder.UseSetting("RateLimiting:SensitivePermitLimit", "100000");

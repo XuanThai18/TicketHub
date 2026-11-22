@@ -13,4 +13,13 @@ public interface IOrderRepository
 
     /// <summary>Id các đơn Pending đã hết hạn, cũ nhất trước, tối đa <paramref name="limit"/> đơn.</summary>
     Task<IReadOnlyList<Guid>> GetExpiredPendingIdsAsync(DateTimeOffset now, int limit, CancellationToken cancellationToken);
+
+    /// <summary>Đơn mà user này đã tạo với Idempotency-Key này (kèm Items, chỉ đọc), hoặc null.</summary>
+    Task<Order?> GetByIdempotencyKeyAsync(Guid userId, string idempotencyKey, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Pending → Paid (kèm paid_at) bằng một UPDATE có điều kiện. Trả true chỉ khi chính lời gọi này đổi được;
+    /// false = đơn đã hết hạn/huỷ/đã trả (vd job hết hạn đã thắng).
+    /// </summary>
+    Task<bool> TryMarkPaidAsync(Guid id, DateTimeOffset now, CancellationToken cancellationToken);
 }

@@ -136,9 +136,9 @@ erDiagram
 |---|---|---|
 | `id`, `order_id` FK | | |
 | `provider` | `varchar(30)` | `Mock` (giả lập cổng thanh toán) |
-| `provider_transaction_id` | `varchar(100)` **unique** | **chìa khoá idempotency**: webhook gọi lại 2 lần chỉ ghi 1 lần |
+| `provider_transaction_id` | `varchar(100)` **unique** | webhook dùng mã này để tìm lượt thanh toán; chặn xử lý 2 lần là nhờ UPDATE có điều kiện `status = 'Pending'` |
 | `amount` | `numeric(18,2)` | |
-| `status` | `varchar(20)` | `Pending` / `Succeeded` / `Failed` |
+| `status` | `varchar(20)` | `Pending` / `Succeeded` / `Failed` / `RefundRequired` (tiền về khi đơn đã hết hạn/huỷ) |
 | `raw_payload` | `jsonb` | nguyên dữ liệu cổng thanh toán gửi về, để đối soát |
 
 ### 2.7 `tickets` — vé điện tử *(Ticket 4)*
@@ -242,10 +242,15 @@ erDiagram
 | Endpoint | Việc |
 |---|---|
 | `POST /api/v1/orders` + header `Idempotency-Key` | Gửi lại cùng key → trả **đơn cũ**, không tạo đơn mới |
-| `POST /api/v1/orders/{id}/pay` | Tạo `payment` `Pending`, trả link thanh toán giả lập |
-| `POST /api/v1/payments/webhook` | Kiểm **chữ ký HMAC** → thành công: đơn `Paid` + **sinh vé**. Gọi lại lần 2 → nhờ `provider_transaction_id` unique nên bỏ qua, trả 200 |
+| `POST /api/v1/orders/{id}/pay` | Tạo `payment` `Pending` (mỗi đơn tối đa một lượt đang chờ), trả link cổng giả lập `/api/v1/mock-gateway/checkout/{tx}/complete` |
+| `POST /api/v1/payments/webhook` | Kiểm **chữ ký HMAC** + timestamp ≤ 5 phút → thành công: đơn `Paid` (sinh vé ở 4.3). Gọi lại lần 2 → lượt thanh toán đã chốt nên bỏ qua, trả 200 |
 
 - **Ca khó:** đơn đã `Expired` (vé đã trả về kho) mà tiền về muộn → không xuất vé, đánh dấu cần hoàn tiền.
+
+**Hoàn thành khi:**
+- [x] 4.1 `Idempotency-Key` cho đặt vé: gửi lại cùng key → 201 cùng đơn + header `Idempotent-Replayed`; khác nội dung → 422; 20 request cùng key cùng lúc → đúng 1 đơn
+- [x] 4.2 Thanh toán + webhook HMAC, webhook gọi lại chỉ xử lý một lần; tiền về khi đơn đã `Expired` → `RefundRequired`
+- [x] 4.3 Sinh vé khi đơn `Paid` (cùng transaction, mỗi chỗ một vé, mã ngẫu nhiên 16 ký tự); `GET /tickets/my` và vé trong chi tiết đơn
 
 ### Ticket 5 — Email vé qua RabbitMQ + Outbox
 
@@ -315,7 +320,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Ticket 1 — Sự kiện + loại vé
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
 - [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
-- [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
+- [x] Ticket 4 — Thanh toán + idempotency (nhánh `ticket-4-payment`, chờ merge) → **cập nhật CV, bắt đầu nộp**
 - [ ] Ticket 5 — RabbitMQ + Outbox
 - [ ] Ticket 6 — Cache
 - [ ] Ticket 7 — Đo tải k6

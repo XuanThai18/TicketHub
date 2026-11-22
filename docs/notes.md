@@ -283,3 +283,139 @@ Khi tắt `xmin` để thử phải tạm bỏ qua cảnh báo `PendingModelChan
 ### 5. Kiểm tên trùng sau khi kiểm loại vé thuộc sự kiện
 
 Bản đầu kiểm tên trước: gọi URL của sự kiện khác (cũng có loại vé tên "VIP") thì nhận **409 trùng tên** thay vì 404. Integration test bắt được, nay kiểm tên sau bước tìm loại vé.
+
+---
+
+## Ticket 4.1: Idempotency-Key cho đặt vé
+
+### 1. Bài toán và cách client dùng
+
+Client bấm "Đặt vé", mạng chập chờn không nhận được phản hồi, app tự gửi lại. Không có chống gửi lặp thì người dùng có **nhiều đơn và bị trừ vé nhiều lần**.
+
+- Client tự sinh một key (thường là UUID) cho **mỗi lần mua**, gửi trong header `Idempotency-Key`, và gửi lại **đúng key đó** khi thử lại.
+- Header không bắt buộc: không gửi thì như trước, luôn tạo đơn mới.
+- Key có phạm vi trong từng user (unique index `(user_id, idempotency_key)`): hai user tình cờ trùng key vẫn là hai đơn.
+
+**Chứng minh lỗi trước khi sửa:** 20 request cùng key bắn cùng lúc tạo ra **5 đơn** (5 × 2 vé là hết 10 vé), các request còn lại nhận `SoldOut`.
+
+### 2. Hành vi
+
+| Tình huống | Kết quả |
+|---|---|
+| Key mới | Tạo đơn, lưu key trên đơn, **201** |
+| Cùng key, cùng nội dung | **201** y hệt lần đầu (cùng `id`, cùng `Location`) + header `Idempotent-Replayed: true`; không trừ vé, không tạo đơn |
+| Cùng key, khác nội dung | **422** `Orders.IdempotencyKeyReused` |
+| Nhiều request cùng key cùng lúc | Đúng **một** đơn; các request còn lại nhận replay, không ai lỗi |
+| Lần đầu thất bại (hết vé, chưa mở bán...) | Không lưu gì; gửi lại cùng key thì chạy lại từ đầu |
+| Header rỗng, toàn khoảng trắng, hoặc > 100 ký tự | **400** |
+
+- **Vì sao 201 khi replay:** client chỉ cần một nhánh xử lý thành công; header `Idempotent-Replayed` cho biết đây là đơn cũ.
+- **Vì sao 422 khi khác nội dung:** theo bản nháp IETF "Idempotency-Key HTTP Header Field". Thêm `ErrorType.Unprocessable` → 422 trong `ToProblem`.
+- **So nội dung bằng các dòng đơn** (`Order.HasSameLines`): so tập `(ticketTypeId, quantity)` với `order_items`, không tính thứ tự. Không cần cột lưu hash request.
+- **Key giữ vĩnh viễn** vì nằm trên chính đơn hàng: gửi lại key của đơn đã hết hạn/huỷ thì nhận lại đơn đó với trạng thái hiện tại. Không cần job dọn key.
+- Lần đầu thất bại thì **không lưu** kết quả lỗi (khác Stripe, vốn lưu cả lỗi). Lý do: không có đơn để gắn key, và thử lại sau khi có người trả vé là hợp lý với người mua.
+
+### 3. Hai đường xử lý
+
+```
+0. Có key → tìm đơn theo (user_id, key) → có thì replay/422 ngay          ← gửi lại sau vài giây
+1–4. Luồng đặt vé như Ticket 3 (UPDATE trừ vé + INSERT đơn có key, 1 transaction)
+5. INSERT vấp ix_orders_user_id_idempotency_key → tìm lại đơn → replay/422  ← nhiều request cùng lúc
+```
+
+- **Bước 0 đặt trước mọi kiểm tra khác:** lần gửi lại vẫn nhận đơn cũ dù lúc đó sự kiện đã hết giờ bán.
+- **Bước 5 không cần khoá riêng.** Hai request cùng qua bước 0 (chưa ai commit). Request đến sau INSERT cùng `(user_id, key)` thì Postgres bắt nó **chờ** request trước commit rồi báo `23505 unique_violation`. Transaction của nó rollback nên **vé vừa trừ tự trả lại**. `AppDbContextBase` đổi lỗi thành `UniqueConstraintException`, handler đọc đơn của request thắng và trả replay.
+- Handler chỉ coi là gửi lặp khi `ConstraintName` đúng là `ix_orders_user_id_idempotency_key` (hằng `PlaceOrderCommandHandler.IdempotencyKeyIndex`). Trùng unique index khác thì để exception đi lên.
+
+### 4. Bẫy: header rỗng bị coi như không gửi
+
+Giá trị header bị cắt khoảng trắng hai đầu, và model binding đổi chuỗi rỗng thành `null`. Kết quả: gửi `Idempotency-Key: "   "` trông y như không gửi header, và đơn được tạo **không có chống gửi lặp** mà client không biết. Controller kiểm `Request.Headers.ContainsKey(...)` để giữ lại chuỗi rỗng, validator trả 400. Integration test `PlaceOrder_InvalidKey_Returns400` bắt được lỗi này.
+
+---
+
+## Ticket 4.2: Thanh toán và webhook
+
+### 1. Luồng
+
+```
+User ──POST /orders/{id}/pay──▶ API: tạo payment Pending, trả checkoutUrl
+User ──mở checkoutUrl──▶ Cổng thanh toán ──khách trả tiền──
+Cổng ──POST /payments/webhook (ký HMAC)──▶ API: kiểm chữ ký → đơn Paid
+```
+
+- **Kết quả thanh toán đến từ webhook do cổng gọi, không đến từ client.** Tin client báo "tôi trả rồi" thì ai cũng giả được.
+- Số tiền của lượt thanh toán lấy từ `order.total_amount` ở server, không bao giờ nhận từ client.
+- **Cổng giả lập** (`POST /api/v1/mock-gateway/checkout/{tx}/complete?outcome=succeeded|failed`, chỉ có ở Development và Testing): dựng webhook, ký bằng khoá chung, rồi đưa vào **đúng handler webhook thật**, nên vẫn đi qua bước kiểm chữ ký. Môi trường khác trả 404.
+
+### 2. Mở lượt thanh toán: mỗi đơn tối đa một lượt đang chờ
+
+- Unique index một phần `ix_payments_order_id_pending` trên `(order_id) WHERE status = 'Pending'`. Bấm "Thanh toán" lần nữa khi lượt trước còn chờ thì nhận lại lượt đó (200); bấm 10 lần cùng lúc thì index chặn, request thua đọc lại lượt của request thắng. Cùng kiểu với Idempotency-Key ở 4.1.
+- Lượt trước `Failed` không bị index chặn (chỉ áp cho `Pending`), nên thanh toán lại được.
+- Đơn không còn `Pending` hoặc **đã quá `expires_at`** (dù job chưa chạy) → 409 `Orders.NotPayable`.
+- **Tên index định nghĩa một chỗ:** `PaymentConfiguration` gọi `.HasDatabaseName(PayOrderCommandHandler.PendingPaymentIndex)`, handler bắt lỗi theo đúng hằng đó. Khác 4.1 (tên index do EF tự đặt, phải dựa vào test để giữ khớp).
+
+### 3. Chữ ký webhook
+
+- `X-Signature: sha256=hex(HMAC-SHA256(khoá, "{timestamp}.{body}"))`, `X-Signature-Timestamp` là giây Unix. Cùng kiểu với Stripe.
+- **Ký trên nguyên văn body:** controller đọc body thô thay vì bind sang object. Parse rồi serialize lại có thể đổi thứ tự trường hay khoảng trắng và chữ ký sẽ sai.
+- **So bằng `CryptographicOperations.FixedTimeEquals`:** so từng byte rồi dừng ở byte sai đầu tiên thì thời gian phản hồi lộ ra số byte đúng, đo nhiều lần là đoán dần được chữ ký.
+- **Timestamp nằm trong phần được ký và phải lệch ≤ 5 phút:** chặn kẻ bắt được một webhook cũ rồi gửi lại. Đổi timestamp để "làm mới" thì chữ ký không khớp nữa.
+- Khoá ở `Payments:WebhookSecret` (≥ 32 ký tự, `ValidateOnStart`): thiếu khoá thì app không khởi động, thay vì chạy rồi từ chối mọi webhook. Production đặt qua biến môi trường `Payments__WebhookSecret`.
+- Sai chữ ký hoặc quá hạn → 401; không biết mã giao dịch → 404; nhận hợp lệ (kể cả bản lặp) → **200**, để cổng ngừng gửi lại.
+
+### 4. Xử lý webhook: ba UPDATE có điều kiện trong một transaction
+
+```
+a) UPDATE payments SET status = @kếtquả, raw_payload, completed_at WHERE id = @id AND status = 'Pending'
+   → 0 dòng: webhook này đã xử lý rồi → 200, không làm gì thêm
+b) (nếu thành công) UPDATE orders SET status = 'Paid', paid_at = now WHERE id = @orderId AND status = 'Pending'
+c) b) đổi 0 dòng (đơn đã Expired/Cancelled) → UPDATE payments SET status = 'RefundRequired'
+```
+
+- **Phải chốt lượt thanh toán (a) trước khi đụng tới đơn.** Nếu chỉ dựa vào "đơn còn Pending", cổng gửi lặp thì lần thứ hai thấy đơn đã `Paid` (vì chính lần một vừa đổi) và đánh dấu nhầm `RefundRequired`: khách vừa có vé vừa được hoàn tiền. Đã chứng minh: tạm bỏ điều kiện `status = 'Pending'` ở (a), test gửi lặp 10 lần đỏ với payment `RefundRequired` trong khi đơn `Paid`.
+- **Đua với job hết hạn:** cả hai cùng `UPDATE orders ... WHERE status = 'Pending'`, chỉ một bên thắng.
+  - Webhook thắng (kể cả khi đã quá `expires_at` vài giây nhưng job chưa chạy): vé vẫn đang giữ cho đơn → nhận tiền, đơn `Paid`, job bỏ qua.
+  - Job thắng: vé đã về kho → payment `RefundRequired`, không xuất vé.
+- **Huỷ đơn sau khi đã mở thanh toán:** tiền về sau đó cũng rơi vào (c) → `RefundRequired`.
+- `ck_orders_paid_at` đòi `(status = 'Paid') = (paid_at IS NOT NULL)` nên (b) đặt cả hai cột trong cùng câu. `ck_payments_completed_at` tương tự cho payment.
+
+### 5. Giới hạn đã biết
+
+- `RefundRequired` mới chỉ là đánh dấu; chưa có màn hình hay job hoàn tiền thật.
+- Chưa so `amount` trong webhook với `payments.amount` (cổng giả lập không gửi số tiền). Cổng thật thì phải so, lệch thì không chuyển `Paid`.
+- `ExecuteUpdate` bỏ qua interceptor audit nên `updated_at/updated_by` của payment và đơn không được điền (giống huỷ/hết hạn ở Ticket 2).
+
+---
+
+## Ticket 4.3: Sinh vé
+
+### 1. Sinh vé trong cùng transaction với bước đơn → Paid
+
+```
+webhook thành công
+  a) chốt payment (Pending → Succeeded)
+  b) TryMarkPaidAsync(đơn) → true
+     → đọc đơn kèm order_items → mỗi chỗ một Ticket.Issue → SaveChanges   ← cùng transaction
+```
+
+- **Không bao giờ có đơn Paid mà thiếu vé** (hay vé mà đơn chưa Paid): commit thì có cả hai, lỗi thì rollback cả hai.
+- **Webhook gửi lặp không sinh vé lần hai:** vé chỉ được phát khi chính lời gọi này vừa đổi được đơn sang `Paid` (bước b trả `true`). Lần lặp dừng ngay ở bước (a). Integration test bắn 10 webhook cùng lúc cho đơn 1 chỗ → đúng 1 vé.
+- **Tiền về khi đơn đã hết hạn:** bước (b) trả `false` → `RefundRequired`, không phát vé (vé đã về kho và có thể đã bán cho người khác).
+- Đơn 2 VIP + 1 Thường → 3 dòng `tickets`, mỗi dòng gắn `ticket_type_id` riêng.
+
+### 2. Mã vé
+
+- 16 ký tự lấy từ bảng 31 ký tự `A–Z, 2–9` **bỏ 0/O, 1/I/L** (dễ đọc nhầm khi soát vé bằng tay) → khoảng 79 bit ngẫu nhiên.
+- Sinh bằng `RandomNumberGenerator` (ngẫu nhiên mật mã), không dùng `Random`: mã vé là thứ người khác không được đoán ra để vào cửa.
+- Unique index `ix_tickets_code` là lưới an toàn cuối. Với 79 bit, trùng gần như không thể; nếu có, `SaveChanges` lỗi → transaction rollback → webhook trả 500 → cổng gửi lại → lần sau sinh mã mới (payment vẫn `Pending` vì bước a cũng rollback).
+
+### 3. Xem vé
+
+- `GET /api/v1/tickets/my`: vé của người đang đăng nhập (join qua `orders.user_id`), phân trang, mới phát trước, kèm tên sự kiện, giờ diễn, tên loại vé.
+- `GET /api/v1/orders/{id}`: thêm danh sách `tickets` của đơn (rỗng khi chưa thanh toán).
+
+### 4. Chưa làm
+
+- Soát vé (`Valid → Used`) và huỷ vé (`Cancelled`) khi huỷ sự kiện/hoàn tiền.
+- Hoàn tiền thật cho `RefundRequired`: chưa làm (mới chỉ đánh dấu).
+- Gửi vé qua email (Ticket 5).
