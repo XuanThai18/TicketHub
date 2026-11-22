@@ -1,110 +1,197 @@
-# TicketHub — .NET 10 Clean Architecture API template
+# TicketHub — API bán vé sự kiện chịu tải cao
 
-Template Web API cho dự án mới: Clean Architecture, CQRS với MediatR, EF Core (ghi) + Dapper (đọc) trên PostgreSQL, Redis, JWT, OpenTelemetry, test đầy đủ với Testcontainers.
+Backend bán vé viết bằng **.NET 10**, Clean Architecture + CQRS, PostgreSQL, Redis.
 
-## Dùng template
+Bài toán cốt lõi: **mở bán 1.000 vé, 10.000 người bấm mua cùng lúc** — không bán vượt số vé, không trừ tiền hai lần khi khách bấm lại hay cổng thanh toán gọi lại, không phát vé cho đơn đã hết hạn giữ chỗ.
 
-```bash
-dotnet new install .                       # cài từ thư mục này (chạy lại sau khi sửa template)
-dotnet new ca-api -n Acme.Shop             # tạo solution mới, đổi mọi "TicketHub" thành "Acme.Shop"
-dotnet new ca-api -n Acme.Shop --IncludeSample false   # bỏ feature mẫu Products
-dotnet new ca-api -n Acme.Shop --auth none # không có module đăng nhập (dùng IdP ngoài)
-dotnet new uninstall .                     # gỡ template
+Mỗi vấn đề dưới đây được **chứng minh bằng test trước khi sửa** (test đỏ trên code cũ, xanh sau khi sửa), chạy trên PostgreSQL thật trong container.
+
+---
+
+## Điểm nổi bật
+
+| Vấn đề | Cách giải | Bằng chứng (integration test) |
+|---|---|---|
+| **Bán vượt số vé** khi nhiều người mua cùng lúc (lost update) | Trừ vé bằng `UPDATE ... WHERE available_quantity >= @q` trong transaction, khoá dòng theo thứ tự `ticket_type_id` để tránh deadlock | 50 người tranh 10 vé: trước khi sửa **50 đơn được tạo, kho vẫn còn 8–9**; sau khi sửa **đúng 10 đơn, 40 người nhận `SoldOut`** |
+| Chọn cách chống bán vượt | Làm và đo cả ba cách: khoá bi quan (`FOR UPDATE`), khoá lạc quan (`xmin` + thử lại), UPDATE nguyên tử | Khoá lạc quan cần **~280 lần thử lại** cho 50 request; giới hạn 3 lần thử thì **bán thiếu** (chỉ 4–6/10 vé). Chọn UPDATE nguyên tử: 0 lần thử lại |
+| **App tự gửi lại request đặt vé** khi mạng chập chờn | Header `Idempotency-Key`, unique index `(user_id, idempotency_key)`; gửi lại cùng key → trả lại đơn cũ (201 + `Idempotent-Replayed: true`), khác nội dung → 422 | 20 request cùng key cùng lúc: trước khi sửa **5 đơn**; sau khi sửa **đúng 1 đơn**, cả 20 request nhận cùng một đơn |
+| **Webhook thanh toán bị gọi lặp** (kể cả cùng lúc) | Chữ ký HMAC-SHA256 trên body thô + timestamp (≤ 5 phút), so sánh thời gian không đổi; chốt lượt thanh toán bằng UPDATE có điều kiện **trước** khi đụng tới đơn | 10 webhook giống nhau cùng lúc → xử lý **đúng một lần, đúng 1 vé**. Bỏ điều kiện chốt → test đỏ: khách vừa có vé vừa bị đánh dấu hoàn tiền |
+| **Tiền về sau khi đơn đã hết hạn** (job trả vé về kho chạy trước) | Webhook và job hết hạn cùng `UPDATE orders ... WHERE status = 'Pending'`, chỉ một bên thắng; webhook thua → payment `RefundRequired`, không phát vé | Cả hai thứ tự (job trước / webhook trước) đều có test |
+| **Admin tăng số vé đúng lúc đang bán** | `xmin` làm concurrency token, xung đột thì đọc lại và áp lại (tối đa 3 lần) | Tắt `xmin`: **bán 22 vé cho tổng 20**; có `xmin`: bán đúng 20 |
+| Huỷ đơn / job hết hạn trả vé hai lần | `UPDATE ... WHERE status = 'Pending'` + cộng kho bằng SQL (`available = available + n`) | Huỷ hai lần, huỷ đồng thời, quét hai lần → vé chỉ trả về một lần |
+
+Chi tiết từng quyết định, số liệu và giới hạn đã biết: [`docs/notes.md`](docs/notes.md). Kế hoạch theo ticket: [`docs/DESIGN.md`](docs/DESIGN.md).
+
+---
+
+## Luồng mua vé
+
+```mermaid
+sequenceDiagram
+    actor U as Khách
+    participant API as TicketHub API
+    participant DB as PostgreSQL
+    participant G as Cổng thanh toán
+    participant J as Job hết hạn (30s)
+
+    U->>API: POST /orders (Idempotency-Key)
+    API->>DB: UPDATE ticket_types SET available -= q WHERE available >= q
+    API->>DB: INSERT order Pending (giữ chỗ 10 phút)
+    API-->>U: 201 { id }
+
+    U->>API: POST /orders/{id}/pay
+    API->>DB: INSERT payment Pending (mỗi đơn tối đa 1)
+    API-->>U: checkoutUrl
+    U->>G: trả tiền
+
+    G->>API: POST /payments/webhook (ký HMAC)
+    API->>DB: UPDATE payment WHERE status = 'Pending'  (chặn gọi lặp)
+    API->>DB: UPDATE order SET Paid WHERE status = 'Pending'
+    API->>DB: INSERT tickets (mỗi chỗ một mã)
+    API-->>G: 200
+
+    J->>DB: đơn Pending quá hạn → Expired, trả vé về kho
+    Note over API,J: Webhook và job cùng nhắm đơn Pending: ai UPDATE trước thì thắng.<br/>Job thắng → payment RefundRequired, không phát vé.
 ```
 
-| Tuỳ chọn | Mặc định | Ý nghĩa |
+---
+
+## Kiến trúc
+
+```mermaid
+flowchart LR
+    Api["TicketHub.Api<br/>Controller mỏng, auth, rate limit,<br/>OpenAPI, health, logging"]
+    App["TicketHub.Application<br/>Command/Query + Handler (MediatR)<br/>Validator (FluentValidation)"]
+    Infra["TicketHub.Infrastructure<br/>EF Core, Dapper, repository,<br/>interceptor, migration, job nền"]
+    Domain["TicketHub.Domain<br/>Entity, Result/Error,<br/>interface repository"]
+    Api --> Infra --> App --> Domain
+    Infra --> PG[(PostgreSQL)]
+    Infra --> Redis[(Redis)]
+```
+
+- **Chiều phụ thuộc bị khoá bằng architecture test** (NetArchTest): Domain không phụ thuộc gì; Application không được tham chiếu Infrastructure hay ASP.NET Core; chỉ query handler được đọc DB trực tiếp.
+- **Ghi** qua repository + `IUnitOfWork` (EF Core có tracking, interceptor audit và xoá mềm). Các thao tác có tranh chấp dùng **UPDATE có điều kiện** ngay trong SQL thay vì đọc rồi ghi.
+- **Đọc** qua `IReadDbContext` (không tracking, `Select` thẳng sang DTO), hoặc Dapper khi LINQ không hợp.
+- Lỗi nghiệp vụ trả về bằng `Result`/`Error` (không ném exception), đổi sang ProblemDetails ở một chỗ duy nhất.
+
+**Công nghệ:** .NET 10 · ASP.NET Core · EF Core 10 + Npgsql · Dapper · PostgreSQL 16 · Redis 7 · MediatR · FluentValidation · Serilog · OpenTelemetry (Aspire Dashboard) · Scalar · xUnit v3 · NSubstitute · Testcontainers · NetArchTest · Docker Compose · GitHub Actions / GitLab CI.
+
+---
+
+## Tính năng
+
+| Nhóm | Endpoint | Quyền |
 |---|---|---|
-| `--IncludeSample` | `true` | Kèm feature mẫu `Products` (entity, command/query, controller, migration, test) |
-| `--auth` | `local` | `local`: module đăng nhập riêng (xem mục Đăng nhập). `none`: chỉ kiểm JWT, token do Keycloak/Entra/Auth0 cấp |
-| `--SkipRestore` | `false` | Không tự `dotnet restore` sau khi tạo |
+| Sự kiện | `POST /api/v1/events`, `PUT /events/{id}`, `POST /events/{id}/publish` | Admin, Manager |
+| | `POST /events/{id}/cancel` | Admin |
+| | `GET /events` (phân trang, tìm theo tên, lọc ngày `?from=&to=`), `GET /events/{id}` | ẩn danh |
+| Loại vé | `POST /events/{id}/ticket-types`, `PUT /events/{id}/ticket-types/{ticketTypeId}` (sửa được cả khi đang bán) | Admin, Manager |
+| Đơn hàng | `POST /api/v1/orders` (+ `Idempotency-Key`), `POST /orders/{id}/cancel` | đăng nhập |
+| | `GET /orders/my`, `GET /orders/{id}` (chủ đơn hoặc Admin; người khác 404) | đăng nhập |
+| Thanh toán | `POST /orders/{id}/pay` | chủ đơn |
+| | `POST /api/v1/payments/webhook` | cổng thanh toán (chữ ký HMAC) |
+| Vé | `GET /api/v1/tickets/my` | đăng nhập |
+| Tài khoản | `/api/v1/auth/login`, `/refresh`, `/logout`, `/me`, `/sessions`, `/change-password`, `/users` | xem mục [Đăng nhập](#đăng-nhập) |
 
-Cổng `launchSettings.json` được sinh ngẫu nhiên cho mỗi project để không đụng nhau.
+Chạy nền: **`OrderExpiryService`** mỗi 30 giây chuyển đơn quá hạn giữ chỗ sang `Expired` và trả vé về kho (mỗi đơn một transaction, lỗi một đơn không chặn đơn khác).
 
-## Chạy local
+---
+
+## Chạy thử nhanh
+
+Yêu cầu: Docker Desktop.
+
+```bash
+cp .env.example .env          # điền POSTGRES_USER/PASSWORD, JWT_SECRET (>= 32 ký tự)
+docker compose up -d --build  # Postgres, Redis, Aspire Dashboard, API (tự chạy migration)
+```
+
+Mở **http://localhost:8080/scalar** để xem tài liệu và gọi thử API.
+
+**1. Lấy token** (endpoint chỉ có ở Development; `subject` là Id người dùng, phải là Guid):
+
+```bash
+# token ban tổ chức
+curl -X POST http://localhost:8080/dev/token -H "Content-Type: application/json" \
+     -d '{"subject":"11111111-1111-1111-1111-111111111111","roles":["Admin"]}'
+# token người mua
+curl -X POST http://localhost:8080/dev/token -H "Content-Type: application/json" \
+     -d '{"subject":"22222222-2222-2222-2222-222222222222","roles":["User"]}'
+```
+
+Dán `accessToken` vào mục Authentication (Bearer) của Scalar.
+
+**2. Đi hết một lần mua vé trên Scalar:**
+
+1. *(Admin)* `POST /events` → `POST /events/{id}/ticket-types` → `POST /events/{id}/publish`.
+2. *(User)* `POST /orders` với `{ "lines": [{ "ticketTypeId": "...", "quantity": 2 }] }`.
+3. *(User)* `POST /orders/{id}/pay` → nhận `checkoutUrl`.
+4. Gọi **POST** tới `checkoutUrl` (cổng thanh toán giả lập, chỉ có ở Development; thêm `?outcome=failed` để giả lập thất bại).
+5. *(User)* `GET /orders/{id}` → đơn `Paid` kèm 2 vé; `GET /tickets/my`.
+
+Xem SQL mà EF sinh ra cho từng request: `docker logs -f tickethub_api`.
+
+| Địa chỉ | Nội dung |
+|---|---|
+| `http://localhost:8080/scalar` | Tài liệu API + gọi thử (Development) |
+| `http://localhost:8080/openapi/v1.json` | Tài liệu OpenAPI |
+| `http://localhost:8080/health/live`, `/health/ready` | Probe cho k8s |
+| `http://localhost:18888` | Aspire Dashboard: trace, metrics |
+
+---
+
+## Phát triển
 
 Yêu cầu: .NET SDK 10, Docker Desktop.
 
 ```bash
-cp .env.example .env                                   # điền mật khẩu DB, JWT secret
-docker compose up -d postgres redis aspire-dashboard   # hạ tầng (Postgres ở cổng host 5433)
+cp .env.example .env
+docker compose up -d postgres redis aspire-dashboard   # chỉ hạ tầng (Postgres ở cổng host 5433)
 dotnet tool restore                                    # dotnet-ef
-dotnet run --project src/TicketHub.Api                   # API (Development: tự migrate)
+dotnet run --project src/TicketHub.Api                 # http://localhost:5315/scalar, tự migrate, in SQL ra console
 ```
 
-Hoặc chạy cả API trong container: `docker compose up --build`.
+> Postgres trong Docker mở ra máy host ở cổng **5433** (đổi bằng `POSTGRES_PORT` trong `.env`) để không đụng PostgreSQL cài sẵn trên máy. Nếu đổi cổng thì sửa luôn `ConnectionStrings:DefaultConnection` trong `appsettings.Development.json`.
 
-> Postgres trong Docker mở ra máy host ở cổng **5433** (đổi bằng `POSTGRES_PORT` trong `.env`) để không đụng PostgreSQL cài sẵn trên máy, thường chiếm 5432. Nếu đổi cổng thì sửa luôn `ConnectionStrings:DefaultConnection` trong `appsettings.Development.json`.
-
-| Địa chỉ | Nội dung |
-|---|---|
-| `http://localhost:<port>/scalar` | Tài liệu API + gọi thử (chỉ Development) |
-| `http://localhost:<port>/openapi/v1.json` | Tài liệu OpenAPI |
-| `http://localhost:<port>/health/live`, `/health/ready` | Probe cho k8s |
-| `http://localhost:18888` | Aspire Dashboard: trace, metrics |
-
-**Lấy token để gọi thử** (chỉ có ở Development):
-
-```bash
-curl -X POST http://localhost:<port>/dev/token -H "Content-Type: application/json" \
-     -d '{"subject":"dev-user","roles":["Admin"]}'
-```
-
-Với `--auth local`, Development tự tạo tài khoản `admin@example.com` / `ChangeMe123!` (cấu hình `Auth:SeedAdmin` trong `appsettings.Development.json`) để đăng nhập thật qua `/api/v1/auth/login`.
-
-## Đăng nhập (`--auth local`)
-
-Bảng nằm trong schema `auth`, `AuthDbContext` và migration riêng (`src/TicketHub.Infrastructure/Auth`), tách khỏi dữ liệu nghiệp vụ:
-
-| Bảng | Nội dung |
-|---|---|
-| `auth.users` | Email (chữ thường, unique), mật khẩu băm PBKDF2, khoá tạm, `security_stamp` |
-| `auth.user_roles` | Vai trò: `Admin`, `Manager`, `User` (hằng `Roles`) |
-| `auth.user_sessions` | Mỗi dòng một thiết bị đang đăng nhập; chỉ lưu **SHA-256** của refresh token |
-
-| Endpoint | Quyền | Việc |
-|---|---|---|
-| `POST /api/v1/auth/login` | ẩn danh | Trả access token (15') + refresh token (14 ngày) |
-| `POST /api/v1/auth/refresh` | ẩn danh | Đổi refresh token lấy cặp mới; token cũ hết hiệu lực ngay |
-| `POST /api/v1/auth/logout`, `/logout-all` | đăng nhập | Thu hồi phiên hiện tại / mọi phiên |
-| `GET /api/v1/auth/me`, `/sessions` | đăng nhập | Thông tin user; danh sách thiết bị đang đăng nhập |
-| `POST /api/v1/auth/change-password` | đăng nhập | Đổi mật khẩu, thu hồi mọi phiên khác |
-| `POST /api/v1/auth/users` | Admin | Tạo tài khoản |
-| `POST /api/v1/auth/register` | ẩn danh | Tự đăng ký — **tắt mặc định** (`Auth:AllowSelfRegistration`) |
-
-**Cách FE giữ refresh token:**
-
-- **Web (mặc định):** refresh token nằm trong cookie `HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth` — JavaScript không đọc được, lỗi XSS không lấy cắp được. Body login chỉ có access token: giữ trong **bộ nhớ** (biến JS), không ghi `localStorage`. Khi access token hết hạn: `POST /api/v1/auth/refresh` **không body**, kèm header `X-CSRF: 1` và `credentials: "include"`. Đường dẫn gọi phải viết thường (`/auth`) vì `Path` của cookie phân biệt hoa thường.
-- **Mobile / hệ thống khác:** gửi header `X-Client-Type: mobile` khi login → refresh token trả trong body; refresh bằng body `{ "refreshToken": "..." }`. Muốn mọi client đều dùng body: `Auth:RefreshToken:DefaultTransport = Body`.
-- FE khác origin dùng cookie: `Cors:AllowCredentials = true` và liệt kê `Cors:AllowedOrigins`. FE khác **site** (khác domain gốc) thì `Auth:RefreshToken:SameSite = None`.
-
-**Bảo vệ đi kèm:** khoá 15' sau 5 lần sai mật khẩu; cùng một thông báo lỗi cho sai email và sai mật khẩu (kèm băm giả để thời gian phản hồi như nhau); rate limit riêng 100 request/phút/IP cho login, refresh, register (`RateLimiting:SensitivePermitLimit`; để rộng vì cả văn phòng thường chung một IP qua NAT — chống dò mật khẩu một tài khoản là việc của cơ chế khoá tài khoản); refresh token dùng lại sau khi đã đổi → **thu hồi cả họ phiên** (trừ 10 giây ân hạn cho hai tab refresh cùng lúc); concurrency token `xmin` chặn hai request cùng đổi một phiên.
-
-**Giới hạn đã biết:** access token không kiểm DB ở mỗi request (stateless) nên đăng xuất / đổi mật khẩu chỉ chặn được access token đã phát khi nó hết hạn (tối đa `Auth:AccessTokenMinutes`). Cần chặn tức thì thì thêm kiểm `sid` với danh sách phiên bị thu hồi trong Redis ở `OnTokenValidated` của JwtBearer.
-
-**Production:** đặt `Auth__SeedAdmin__Email` / `Auth__SeedAdmin__Password` cho lần chạy đầu (chỉ tạo khi bảng users trống), đăng nhập rồi đổi mật khẩu ngay, sau đó gỡ biến môi trường.
-
-
-## Cấu trúc
+### Cấu trúc
 
 ```
 src/
-  TicketHub.Domain          Entity, Result/Error, interface repository. Không phụ thuộc gì.
-  TicketHub.Application     Command/Query + Handler + Validator (MediatR), abstraction (IUnitOfWork, IReadDbContext, ICurrentUser…)
-  TicketHub.Infrastructure  EF Core, Dapper, Redis, repository, interceptor audit/soft-delete, migration
-  TicketHub.Api             Controller, auth, rate limit, OpenAPI, health, logging/tracing
+  TicketHub.Domain          Events, TicketTypes, Orders, Payments, Tickets, Auth; Result/Error
+  TicketHub.Application     Command/Query + Handler + Validator theo từng nghiệp vụ
+  TicketHub.Infrastructure  EF Core, Dapper, repository, interceptor, migration, OrderExpiryService
+  TicketHub.Api             Controller, auth, rate limit, OpenAPI, health, cổng thanh toán giả lập
 tests/
   TicketHub.UnitTests          Domain + handler + validator (NSubstitute)
-  TicketHub.ArchitectureTests  Khoá chiều phụ thuộc giữa các tầng (NetArchTest)
+  TicketHub.ArchitectureTests  Khoá chiều phụ thuộc giữa các tầng
   TicketHub.IntegrationTests   API thật + Postgres/Redis trong container (Testcontainers)
+docs/
+  DESIGN.md   Thiết kế và kế hoạch theo ticket
+  notes.md    Quyết định kỹ thuật: làm gì, vì sao, giới hạn đã biết
 ```
 
-Chiều phụ thuộc: `Api → Infrastructure → Application → Domain`. Application được dùng EF Core (chỉ trong query handler) nhưng không được tham chiếu provider Npgsql hay Infrastructure. Architecture test sẽ đỏ nếu vi phạm.
+### Test
+
+**223 test**: 132 unit, 9 architecture, 82 integration. Integration test cần Docker đang chạy.
+
+```bash
+dotnet test --solution TicketHub.slnx                          # tất cả
+dotnet test --project tests/TicketHub.UnitTests                # chỉ unit test
+dotnet test --project tests/TicketHub.IntegrationTests --filter-class "*PaymentEndpointsTests"
+
+# Test bán vượt (50 người, 10 vé) kèm số liệu thời gian: tìm dòng [oversell]
+dotnet test --project tests/TicketHub.IntegrationTests --filter-method "*NeverOversell" --output Detailed
+```
+
+Các test tranh chấp bắn request song song bằng `Task.WhenAll` qua HTTP thật, rồi kiểm kết quả bằng cách đếm thẳng trong DB (không tin vào cột `available_quantity`).
+
+---
 
 ## Quy ước
 
-**Thêm một feature** — làm theo `Products`:
+**Thêm một nghiệp vụ** — làm theo `Orders`:
 
-1. `Domain/<Feature>/`: entity (setter private, factory trả `Result`), `<Feature>Errors`, `I<Feature>Repository`.
+1. `Domain/<Feature>/`: entity (setter private, factory trả `Result`), lỗi trong `Domain/Shared/<Feature>Errors`, `I<Feature>Repository`.
 2. `Application/<Feature>/`: mỗi use case một file gồm command/query + validator + handler (handler `sealed`).
 3. `Infrastructure/Persistence/`: `<Feature>Configuration` (EF) và `<Feature>Repository`. Repository tự đăng ký DI theo quy ước tên `XxxRepository` ↔ `IXxxRepository`.
 4. `Api/Controllers/<Feature>Controller` kế thừa `BaseApiController`, chỉ gọi `ISender`. DTO HTTP để ở `Api/Contracts`.
@@ -115,90 +202,65 @@ Chiều phụ thuộc: `Api → Infrastructure → Application → Domain`. Appl
 | Loại lỗi | Cách làm | HTTP |
 |---|---|---|
 | Dữ liệu đầu vào sai định dạng | FluentValidation → `ValidationBehavior` ném `CustomValidationException` | 400 + `errors` theo field |
-| Lỗi nghiệp vụ dự kiến được | Handler trả `Result.Failure(Error.NotFound/Conflict/…)` | 404 / 409 / 403 … + `code` |
-| Lỗi bất ngờ | Cứ để exception bay lên | 500, không lộ chi tiết |
+| Lỗi nghiệp vụ dự kiến được | Handler trả `Result.Failure(Error.NotFound/Conflict/Unprocessable/…)` | 404 / 409 / 422 / 403 … + `code` |
+| Lỗi bất ngờ | Để exception bay lên `GlobalExceptionHandler` | 500, không lộ chi tiết |
 
-Mọi lỗi trả về dạng `application/problem+json` có `traceId` để tra log/trace.
+Mọi lỗi trả về dạng `application/problem+json` có `code` và `traceId` để tra log/trace.
 
-**Đọc/ghi tách đôi:**
+**Tranh chấp dữ liệu:** thao tác nào có thể bị hai request chạm cùng lúc (trừ/cộng vé, đổi trạng thái đơn hay thanh toán) thì điều kiện phải nằm **ngay trong câu UPDATE** (`WHERE status = 'Pending'`, `WHERE available >= q`), kết quả là số dòng bị đổi. Đọc lên kiểm tra rồi mới ghi sẽ có khoảng trống cho request khác chen vào.
 
-- **Ghi (command):** repository + EF Core có tracking, interceptor audit/soft-delete, `IUnitOfWork`. Command handler **không** được dùng EF trực tiếp (architecture test kiểm).
-- **Đọc (query) — mặc định LINQ:** `IReadDbContext.Query<T>()` trả `IQueryable` không tracking, đã lọc bản ghi xoá mềm. Luôn kết thúc bằng `Select` sang DTO để chỉ lấy cột cần (xem `GetProductById`, `ListProducts`, phép chiếu dùng chung `ProductResponse.Projection`).
-- **Đọc — SQL tay (Dapper) khi LINQ không hợp:** qua `ISqlConnectionFactory` (xem `GetProductPriceStats`). Dapper **không** đi qua query filter của EF → SQL phải tự lọc `is_deleted = false`.
-
-| Truy vấn | Viết bằng |
-|---|---|
-| Chi tiết theo id, danh sách lọc/sắp xếp/phân trang, join 2–3 bảng | LINQ + `Select` |
-| Báo cáo: `GROUP BY` nhiều tầng, window function, CTE, `percentile_cont`… | SQL tay (Dapper) |
-| Tính năng riêng Postgres: JSONB, full-text, `DISTINCT ON`, `LATERAL` | SQL tay (Dapper) |
-| Hot path đã đo thấy chậm và không chỉnh được qua LINQ | SQL tay (Dapper) |
-
-Dấu hiệu chuyển sang SQL: phải "vật lộn" để LINQ sinh đúng câu SQL mình muốn. Xem SQL EF sinh ra bằng cách hạ `Microsoft.EntityFrameworkCore.Database.Command` xuống `Information` trong `Serilog:MinimumLevel:Override`.
-
-**Audit & xoá mềm:** entity cài `IAuditableEntity` được tự điền `created_at/by`, `updated_at/by`. Entity cài `ISoftDeletable` thì `Remove()` chỉ bật `is_deleted`; query EF tự lọc (muốn thấy hết dùng `IgnoreQueryFilters()`).
-
-**Transaction:**
-
-- Mặc định chỉ cần **một** `unitOfWork.SaveChangesAsync()` cuối handler — EF tự gói mọi INSERT/UPDATE/DELETE đang track vào một transaction.
-- Cần transaction tường minh (gọi `SaveChanges` nhiều lần, trộn `ExecuteUpdate`/SQL thô, đổi isolation level) thì dùng `IUnitOfWork.ExecuteInTransactionAsync`:
-
-```csharp
-return await unitOfWork.ExecuteInTransactionAsync(async ct =>
-{
-    var order = Order.Create(...);              // tạo/nạp entity BÊN TRONG delegate
-    orders.Add(order);
-    await unitOfWork.SaveChangesAsync(ct);
-    var reserved = await inventory.ReserveAsync(order.Id, ct);
-    if (reserved.IsFailure) return reserved;    // Result thất bại → tự rollback, không cần ném exception
-    await unitOfWork.SaveChangesAsync(ct);
-    return Result.Success();
-}, cancellationToken: cancellationToken);
-```
+**Transaction:** một `SaveChangesAsync()` đã là một transaction. Cần nhiều câu lệnh (trộn `ExecuteUpdate` với `SaveChanges`) thì dùng `IUnitOfWork.ExecuteInTransactionAsync`:
 
 | Tình huống | Hành vi |
 |---|---|
 | Delegate chạy xong | Commit |
-| Ném exception | Rollback, exception đi lên nguyên kiểu |
+| Ném exception | Rollback, xoá Change Tracker, exception đi lên nguyên kiểu |
 | Trả `Result` thất bại | Rollback, trả nguyên `Result` |
-| Gọi lồng nhau | Lời gọi trong nhập chung transaction ngoài; chỉ lớp ngoài cùng commit/rollback |
-| Lỗi kết nối tạm thời | Chạy lại cả delegate với Change Tracker đã xoá (vì vậy entity phải tạo/nạp trong delegate) |
+| Gọi lồng nhau | Lời gọi trong nhập chung transaction ngoài |
+| Lỗi kết nối tạm thời | Chạy lại cả delegate với Change Tracker đã xoá — vì vậy mọi thứ cần lưu (`Add`, tạo entity) phải nằm **trong** delegate |
 
-Không tự gọi `Database.BeginTransaction` trong code: EF đang bật `EnableRetryOnFailure`, transaction tự mở ngoài execution strategy sẽ bị EF từ chối. Delegate có thể bị chạy lại khi retry nên đừng gọi dịch vụ ngoài (gửi mail, gọi API…) bên trong — làm sau khi commit.
+Không tự gọi `Database.BeginTransaction` (EF đang bật `EnableRetryOnFailure`). Không gọi dịch vụ ngoài (gửi mail, gọi API) trong delegate vì nó có thể bị chạy lại.
+
+**Audit & xoá mềm:** entity kế thừa `Entity` được tự điền `created_at/by`, `updated_at/by` khi `SaveChanges`; `Remove()` chỉ bật `is_deleted`, query EF tự lọc. Lưu ý: `ExecuteUpdate` bỏ qua interceptor nên không điền `updated_at`.
+
+---
+
+## Đăng nhập
+
+Module đăng nhập riêng: schema `auth`, `AuthDbContext` và migration riêng (`src/TicketHub.Infrastructure/Auth`).
+
+| Endpoint | Quyền | Việc |
+|---|---|---|
+| `POST /api/v1/auth/login` | ẩn danh | Access token (15') + refresh token (14 ngày) |
+| `POST /api/v1/auth/refresh` | ẩn danh | Đổi refresh token lấy cặp mới; token cũ hết hiệu lực ngay |
+| `POST /api/v1/auth/logout`, `/logout-all` | đăng nhập | Thu hồi phiên hiện tại / mọi phiên |
+| `GET /api/v1/auth/me`, `/sessions` | đăng nhập | Thông tin user; danh sách thiết bị đang đăng nhập |
+| `POST /api/v1/auth/change-password` | đăng nhập | Đổi mật khẩu, thu hồi mọi phiên khác |
+| `POST /api/v1/auth/users` | Admin | Tạo tài khoản |
+| `POST /api/v1/auth/register` | ẩn danh | Tự đăng ký — **tắt mặc định** (`Auth:AllowSelfRegistration`) |
+
+- Refresh token cho web nằm trong cookie `HttpOnly; Secure; SameSite=Strict`; DB chỉ lưu **SHA-256** của token. Mobile gửi `X-Client-Type: mobile` để nhận token trong body.
+- Khoá 15' sau 5 lần sai mật khẩu; cùng một thông báo cho sai email và sai mật khẩu; rate limit riêng cho login/refresh/register; refresh token dùng lại sau khi đã đổi → **thu hồi cả họ phiên**; `xmin` chặn hai request cùng đổi một phiên.
+- Development tự tạo tài khoản `admin@example.com` / `ChangeMe123!` (`Auth:SeedAdmin`).
+- **Giới hạn:** access token stateless nên đăng xuất chỉ chặn được access token đã phát khi nó hết hạn (tối đa `Auth:AccessTokenMinutes`).
+
+---
 
 ## Migration
 
-Dữ liệu nghiệp vụ dùng `ApplicationDbContext`; module đăng nhập (`--auth local`) có `AuthDbContext` riêng. Có hơn một context thì mọi lệnh phải ghi `--context`:
+Hai DbContext (`ApplicationDbContext` cho nghiệp vụ, `AuthDbContext` cho đăng nhập) nên mọi lệnh phải ghi `--context`:
 
 ```bash
-# Dữ liệu nghiệp vụ
 dotnet ef migrations add <Ten> --context ApplicationDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure -o Persistence/Migrations
-# Module đăng nhập
-dotnet ef migrations add <Ten> --context AuthDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure -o Auth/Migrations
+dotnet ef migrations add <Ten> --context AuthDbContext        -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure -o Auth/Migrations
 
-dotnet ef migrations script --idempotent --context ApplicationDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure -o migrate.sql
 dotnet ef migrations bundle --context ApplicationDbContext -p src/TicketHub.Infrastructure -s src/TicketHub.Infrastructure -o efbundle
 ```
 
-**Development:** `Database:MigrateOnStartup=true` — app tự chạy migration lúc khởi động, kéo code mới về là DB đúng cấu trúc.
+- **Development:** `Database:MigrateOnStartup=true`, app tự migrate lúc khởi động.
+- **Production:** `MigrateOnStartup=false`; migration là bước riêng trong CI/CD (job `migrate` chạy `efbundle`), trước khi deploy app mới. Lý do: app chỉ cần quyền đọc/ghi dữ liệu, migration lâu không làm k8s giết pod giữa chừng, và lỗi migration dừng deploy thay vì để DB dở dang.
 
-**Production:** `MigrateOnStartup=false`; migration là **một bước riêng trong CI/CD, chạy một lần, trước khi deploy bản app mới** (job `migrate` có sẵn, xem mục CI). Lý do:
-
-1. **Quyền DB tối thiểu** — tự migrate thì tài khoản DB của app phải có quyền `CREATE/ALTER/DROP`; app bị khai thác (vd SQL injection) là lộ luôn quyền đó. Tách ra: app chỉ cần đọc/ghi dữ liệu, quyền sửa cấu trúc chỉ cấp cho bước migration.
-2. **Migration lâu làm pod bị giết** — thêm index cho bảng lớn có thể mất vài phút; app chưa trả lời health check nên k8s khởi động lại pod, migration bị cắt ngang và deploy lặp mãi.
-3. **Kiểm soát lỗi** — bước riêng thì lỗi là dừng deploy (bản cũ vẫn chạy), log rõ ràng, DBA duyệt được SQL trước; lẫn vào lúc khởi động thì khó biết DB đang dở ở đâu.
-
-(EF Core 9+ đã khoá DB khi migrate nên nhiều pod không còn chạy chồng lên nhau — đó không còn là lý do.)
-
-Hai cách đóng gói migration để chạy ở bước đó:
-
-| | `efbundle` (job CI dùng cách này) | `migrate.sql` |
-|---|---|---|
-| Sinh bằng | `dotnet ef migrations bundle` | `dotnet ef migrations script --idempotent` |
-| Là gì | File chạy được chứa sẵn mọi migration | File SQL thuần, đọc/sửa được |
-| Chạy | `./efbundle --connection "<chuỗi kết nối>"` | `psql -f migrate.sql` |
-| Hợp với | CI/CD tự động hoàn toàn | Có DBA duyệt SQL trước khi chạy |
-
-Cả hai đều chỉ chạy migration còn thiếu (theo bảng `__EFMigrationsHistory`), chạy lại không sao. Có `AuthDbContext` thì phải đóng gói và chạy **cho cả hai context**.
+---
 
 ## Cấu hình
 
@@ -209,38 +271,25 @@ Giá trị bí mật **không** nằm trong `appsettings.json`; đặt qua biế
 | `ConnectionStrings__DefaultConnection` | ✔ | PostgreSQL |
 | `ConnectionStrings__Redis` | ✔ | |
 | `JwtSettings__Secret` | ✔ | ≥ 32 ký tự; thiếu/ngắn → app dừng ngay khi khởi động |
-| `JwtSettings__Issuer`, `__Audience` | | Mặc định `TicketHub` |
+| `Payments__WebhookSecret` | ✔ | Khoá ký webhook chung với cổng thanh toán, ≥ 32 ký tự |
+| `Payments__SignatureToleranceSeconds` | | Độ lệch timestamp tối đa của webhook, mặc định 300 |
 | `Cors__AllowedOrigins__0..n` | | Rỗng = chặn cross-origin |
 | `RateLimiting__PermitLimit`, `__WindowSeconds` | | Mặc định 100 request / 60 s mỗi user hoặc IP |
-| `Security__KnownNetworks__0..n` | | CIDR của reverse proxy tin cậy |
-| `Security__UseHttpsRedirection` | | Mặc định tắt (TLS kết thúc ở ingress) |
 | `OpenApi__Enabled` | | Bật tài liệu API ngoài Development |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | Có thì mới bật OpenTelemetry |
 
-## Test
+---
 
-```bash
-dotnet test --solution TicketHub.slnx                         # tất cả (integration test cần Docker đang chạy)
-dotnet test --project tests/TicketHub.UnitTests               # chỉ unit test
-dotnet test --solution TicketHub.slnx --filter-class "*ProductsEndpointsTests"
-```
+## Build & CI
 
-## Build & quản lý gói
+- Phiên bản gói khai báo một chỗ ở `Directory.Packages.props`. `Directory.Build.props`: nullable, analyzer mức Recommended, **warning = lỗi**.
+- MediatR khoá ở 12.5.0 — bản MIT cuối.
+- `.github/workflows/ci.yml` và `.gitlab-ci.yml`: restore → build → quét gói lỗ hổng → test → build image → migrate (job `migrate` tắt mặc định, bật bằng biến `RUN_DB_MIGRATIONS`).
 
-- Phiên bản gói khai báo **một chỗ** ở `Directory.Packages.props` (Central Package Management); `.csproj` chỉ ghi tên gói.
-- `Directory.Build.props`: `net10.0`, nullable, analyzer mức Recommended, **warning = lỗi**. Tinh chỉnh luật trong `.editorconfig`.
-- MediatR khoá ở 12.5.0 — bản MIT cuối; từ 13.x cần license thương mại.
+---
 
-## CI
+## Chưa làm
 
-Có sẵn `.github/workflows/ci.yml` và `.gitlab-ci.yml`: restore → build → quét gói lỗ hổng → test → build image → **migrate**. Giữ file của nền tảng bạn dùng, xoá file còn lại. GitLab cần runner bật `privileged` cho Docker-in-Docker (Testcontainers).
-
-**Job `migrate`** (chỉ chạy trên `main`, sau khi build image thành công): đóng gói migration thành `efbundle` cho từng DbContext rồi chạy lên DB production. Mặc định **tắt** để dự án chưa có DB production không bị CI đỏ. Bật:
-
-| | GitHub Actions | GitLab CI |
-|---|---|---|
-| Công tắc | Variable `RUN_DB_MIGRATIONS = true` | Variable `RUN_DB_MIGRATIONS = true` |
-| Chuỗi kết nối | Secret `PRODUCTION_DB_CONNECTION` trong environment `production` | Variable `PRODUCTION_DB_CONNECTION` (Masked + Protected) |
-| Duyệt tay trước khi chạy | Environment `production` → Required reviewers | Có sẵn (`when: manual`) |
-
-Dùng tài khoản DB riêng có quyền sửa cấu trúc bảng cho job này; app chạy bằng tài khoản chỉ đọc/ghi dữ liệu. Job deploy (đẩy image, cập nhật manifest k8s) đặt **sau** `migrate` — khung mẫu có sẵn dạng comment trong cả hai file.
+- Hoàn tiền thật cho payment `RefundRequired` (hiện mới đánh dấu).
+- Soát vé (`Valid → Used`), huỷ vé khi huỷ sự kiện.
+- Gửi email vé qua RabbitMQ + Outbox, cache Redis cho trang sự kiện, đo tải bằng k6, deploy (Ticket 5–8 trong [`docs/DESIGN.md`](docs/DESIGN.md)).
