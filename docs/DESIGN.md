@@ -251,7 +251,6 @@ erDiagram
 - [x] 4.1 `Idempotency-Key` cho đặt vé: gửi lại cùng key → 201 cùng đơn + header `Idempotent-Replayed`; khác nội dung → 422; 20 request cùng key cùng lúc → đúng 1 đơn
 - [x] 4.2 Thanh toán + webhook HMAC, webhook gọi lại chỉ xử lý một lần; tiền về khi đơn đã `Expired` → `RefundRequired`
 - [x] 4.3 Sinh vé khi đơn `Paid` (cùng transaction, mỗi chỗ một vé, mã ngẫu nhiên 16 ký tự); `GET /tickets/my` và vé trong chi tiết đơn
-- [ ] 4.4 Hoàn tiền thật cho payment `RefundRequired`: job nền gọi API hoàn tiền của cổng (idempotency key = payment id), trạng thái `Refunding` → `Refunded` / `RefundFailed`, tự thử lại; báo khách để Ticket 5
 
 ### Ticket 5 — Email vé qua RabbitMQ + Outbox
 
@@ -321,7 +320,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Ticket 1 — Sự kiện + loại vé
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
 - [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
-- [ ] Ticket 4 — Thanh toán + idempotency → **cập nhật CV, bắt đầu nộp**
+- [x] Ticket 4 — Thanh toán + idempotency (nhánh `ticket-4-payment`, chờ merge) → **cập nhật CV, bắt đầu nộp**
 - [ ] Ticket 5 — RabbitMQ + Outbox
 - [ ] Ticket 6 — Cache
 - [ ] Ticket 7 — Đo tải k6

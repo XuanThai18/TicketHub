@@ -417,5 +417,5 @@ webhook thành công
 ### 4. Chưa làm
 
 - Soát vé (`Valid → Used`) và huỷ vé (`Cancelled`) khi huỷ sự kiện/hoàn tiền.
-- Hoàn tiền thật cho `RefundRequired` (4.4, để sau).
+- Hoàn tiền thật cho `RefundRequired`: chưa làm (mới chỉ đánh dấu).
 - Gửi vé qua email (Ticket 5).
