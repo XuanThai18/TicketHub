@@ -2,9 +2,11 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using RabbitMQ.Client;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Payments;
 using TicketHub.Infrastructure.Auth;
+using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Orders;
 using TicketHub.Infrastructure.Persistence;
 using TicketHub.Infrastructure.Persistence.Contexts;
@@ -25,6 +27,10 @@ public static class DependencyInjection
         var redisConnectionString = configuration.GetConnectionString("Redis");
         if (string.IsNullOrWhiteSpace(redisConnectionString))
             throw new InvalidOperationException("Missing ConnectionStrings:Redis.");
+
+        var rabbitMqConnectionString = configuration.GetConnectionString("RabbitMq");
+        if (string.IsNullOrWhiteSpace(rabbitMqConnectionString))
+            throw new InvalidOperationException("Missing ConnectionStrings:RabbitMq.");
 
         services.TryAddSingleton(TimeProvider.System);
 
@@ -48,6 +54,11 @@ public static class DependencyInjection
         services.AddRepositories();
         services.AddAuthModule();
         services.AddHostedService<OrderExpiryService>();
+
+        // Outbox (Ticket 5): job nền đọc outbox_messages rồi gửi lên RabbitMQ qua một kết nối dùng chung.
+        services.AddSingleton(new ConnectionFactory { Uri = new Uri(rabbitMqConnectionString) });
+        services.AddSingleton<IMessagePublisher, RabbitMqPublisher>();
+        services.AddHostedService<OutboxProcessor>();
 
         // Thiếu khoá webhook (hoặc khoá ngắn) thì app không khởi động, thay vì chạy rồi mới từ chối mọi webhook.
         services.AddOptions<PaymentOptions>()

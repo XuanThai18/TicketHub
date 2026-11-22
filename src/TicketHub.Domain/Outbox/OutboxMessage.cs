@@ -34,4 +34,18 @@ public sealed class OutboxMessage
         Payload = payload,
         OccurredAt = occurredAt
     };
+
+    /// <summary>RabbitMQ đã xác nhận nhận tin → không gửi lại nữa.</summary>
+    public void MarkProcessed(DateTimeOffset processedAt)
+    {
+        ProcessedAt = processedAt;
+        LastError = null;
+    }
+
+    /// <summary>Gửi hỏng: vẫn để chưa gửi, lần quét sau thử lại. Lỗi dài (stack trace...) bị cắt cho vừa cột.</summary>
+    public void MarkFailed(string error)
+    {
+        Attempts++;
+        LastError = error.Length <= LastErrorMaxLength ? error : error[..LastErrorMaxLength];
+    }
 }

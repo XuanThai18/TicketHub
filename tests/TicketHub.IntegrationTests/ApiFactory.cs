@@ -1,9 +1,12 @@
 using System.Net.Http.Headers;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Testcontainers.PostgreSql;
+using Testcontainers.RabbitMq;
 using Testcontainers.Redis;
+using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Security;
 
 [assembly: AssemblyFixture(typeof(TicketHub.IntegrationTests.ApiFactory))]
@@ -11,7 +14,7 @@ using TicketHub.Infrastructure.Security;
 namespace TicketHub.IntegrationTests;
 
 /// <summary>
-/// Dựng API thật trên Postgres + Redis chạy trong container (cần Docker).
+/// Dựng API thật trên Postgres + Redis + RabbitMQ chạy trong container (cần Docker).
 /// Một instance cho cả assembly: container khởi động một lần, mỗi test tự sinh dữ liệu riêng (SKU ngẫu nhiên).
 /// </summary>
 public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
@@ -21,10 +24,17 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder("postgres:16-alpine").Build();
     private readonly RedisContainer _redis = new RedisBuilder("redis:7-alpine").Build();
+    private readonly RabbitMqContainer _rabbitMq = new RabbitMqBuilder("rabbitmq:4-alpine").Build();
+
+    /// <summary>Để test tự kết nối RabbitMQ đọc tin trong queue.</summary>
+    public string RabbitMqConnectionString => _rabbitMq.GetConnectionString();
+
+    /// <summary>Bật <see cref="ControllablePublisher.BrokerDown"/> để giả lập RabbitMQ chết.</summary>
+    public ControllablePublisher Publisher => Services.GetRequiredService<ControllablePublisher>();
 
     public async ValueTask InitializeAsync()
     {
-        await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
+        await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync(), _rabbitMq.StartAsync());
 
         // Khởi động host MỘT lần ở đây. Nếu để test song song cùng gọi CreateClient() lần đầu,
         // Program chạy hai lần đồng thời và bootstrap logger tĩnh của Serilog bị freeze hai lần.
@@ -36,6 +46,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         await base.DisposeAsync();
         await _postgres.DisposeAsync();
         await _redis.DisposeAsync();
+        await _rabbitMq.DisposeAsync();
     }
 
     public HttpClient CreateAuthenticatedClient(params string[] roles) =>
@@ -56,6 +67,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseEnvironment("Testing");
         builder.UseSetting("ConnectionStrings:DefaultConnection", _postgres.GetConnectionString());
         builder.UseSetting("ConnectionStrings:Redis", _redis.GetConnectionString());
+        builder.UseSetting("ConnectionStrings:RabbitMq", _rabbitMq.GetConnectionString());
         builder.UseSetting("JwtSettings:Secret", "integration-test-secret-0123456789abcdef");
         builder.UseSetting("Payments:WebhookSecret", WebhookSecret);
         builder.UseSetting("Database:MigrateOnStartup", "true");
@@ -63,6 +75,16 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseSetting("RateLimiting:SensitivePermitLimit", "100000");
         // 0 giây: dùng lại token đã đổi là bị coi như đánh cắp ngay → kiểm được luồng thu hồi cả họ phiên.
         builder.UseSetting("Auth:RefreshReuseGraceSeconds", "0");
+
+        // Bọc publisher thật trong ControllablePublisher để test giả lập được RabbitMQ chết.
+        builder.ConfigureTestServices(services =>
+        {
+            var original = services.Single(d => d.ServiceType == typeof(IMessagePublisher));
+            services.Remove(original);
+            services.AddSingleton(sp => new ControllablePublisher(
+                (IMessagePublisher)ActivatorUtilities.CreateInstance(sp, original.ImplementationType!)));
+            services.AddSingleton<IMessagePublisher>(sp => sp.GetRequiredService<ControllablePublisher>());
+        });
     }
 
     /// <summary>Client HTTPS có giữ cookie: cookie refresh token gắn cờ Secure nên chỉ gửi qua https.</summary>
