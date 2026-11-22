@@ -6,6 +6,7 @@ using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Orders;
 using TicketHub.Application.Common.Paging;
 using TicketHub.Application.Orders;
+using TicketHub.Application.Payments;
 
 namespace TicketHub.Api.Controllers;
 
@@ -77,6 +78,31 @@ public sealed class OrdersController(ISender sender) : BaseApiController
     {
         var result = await sender.Send(new CancelOrderCommand(id), cancellationToken);
         return HandleResult(result);
+    }
+
+    /// <summary>Mở lượt thanh toán cho đơn Pending. Bấm lại khi lượt trước còn chờ thì nhận lại lượt đó (200).</summary>
+    [HttpPost("{id:guid}/pay")]
+    [Authorize]
+    [ProducesResponseType<PayOrderResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<PayOrderResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> Pay(Guid id, CancellationToken cancellationToken)
+    {
+        var result = await sender.Send(new PayOrderCommand(id), cancellationToken);
+        if (result.IsFailure)
+        {
+            return ToProblem(result.Error);
+        }
+
+        var payment = result.Value;
+        // Cổng giả lập: "trang thanh toán" là endpoint hoàn tất ở MockGatewayController. Cổng thật sẽ trả URL của nó.
+        var response = new PayOrderResponse(
+            payment.PaymentId, payment.Amount, $"/api/v1/mock-gateway/checkout/{payment.ProviderTransactionId}/complete");
+
+        return payment.Created
+            ? StatusCode(StatusCodes.Status201Created, response)
+            : Ok(response);
     }
 
     private const string IdempotencyKeyHeader = "Idempotency-Key";

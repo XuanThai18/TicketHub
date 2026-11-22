@@ -17,6 +17,18 @@ internal sealed class OrderRepository(ApplicationDbContext dbContext) : IOrderRe
         return rows == 1;
     }
 
+    // Webhook thanh toán và job hết hạn cùng nhắm đơn Pending: ai UPDATE trước thì thắng, bên kia nhận 0 dòng.
+    // Đặt status và paid_at cùng lúc vì ck_orders_paid_at đòi (status = 'Paid') = (paid_at IS NOT NULL).
+    public async Task<bool> TryMarkPaidAsync(Guid id, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var rows = await dbContext.Set<Order>()
+            .Where(o => o.Id == id && o.Status == OrderStatus.Pending)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(o => o.Status, OrderStatus.Paid)
+                .SetProperty(o => o.PaidAt, (DateTimeOffset?)now), cancellationToken);
+        return rows == 1;
+    }
+
     // Cùng kiểu với huỷ: chỉ luồng đổi được Pending mới nhận 1 dòng. Điều kiện hết hạn nằm trong UPDATE nên job không huỷ nhầm đơn còn hạn.
     public async Task<bool> TryExpirePendingAsync(Guid id, DateTimeOffset now, CancellationToken cancellationToken)
     {

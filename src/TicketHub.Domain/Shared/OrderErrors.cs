@@ -26,6 +26,9 @@ public static class OrderErrors
     public static readonly Error NotExpirable = Error.Conflict(
         "Orders.NotExpirable", "Only pending orders that have passed their expiry time can expire.");
 
+    public static readonly Error NotPayable = Error.Conflict(
+        "Orders.NotPayable", "Only pending orders that have not expired can be paid.");
+
     public static Error NotFound(Guid id) => Error.NotFound(
         "Orders.NotFound", $"Order '{id}' was not found.");
 
