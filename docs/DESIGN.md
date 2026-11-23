@@ -63,7 +63,7 @@ erDiagram
     AUTH_USERS ||--o{ ORDERS : "đặt (user_id, không FK)"
 ```
 
-`outbox_messages` là bảng kỹ thuật (Ticket 5), không có quan hệ khoá ngoại.
+`outbox_messages` và `processed_messages` là bảng kỹ thuật (Ticket 5), không có quan hệ khoá ngoại.
 
 ### 2.3 `events` — sự kiện *(Ticket 1)*
 
@@ -162,7 +162,17 @@ erDiagram
 | `occurred_at`, `processed_at` | `timestamptz` | `processed_at` null = chưa xử lý |
 | `attempts`, `last_error` | | thử lại bao nhiêu lần, lỗi gần nhất |
 
-- **Index:** trên `processed_at` (lọc `IS NULL`).
+- **Index:** `ix_outbox_messages_unprocessed` trên `occurred_at`, chỉ gồm dòng `processed_at IS NULL` (index một phần).
+
+### 2.9 `processed_messages` — tin consumer đã xử lý *(Ticket 5)*
+
+| Cột | Kiểu | Ghi chú |
+|---|---|---|
+| `message_id` | `uuid` | = `outbox_messages.id`, giữ nguyên khi RabbitMQ giao lại |
+| `consumer` | `varchar(100)` | vd `ticket-emails` |
+| `processed_at` | `timestamptz` | |
+
+- **Khoá chính** `(message_id, consumer)`: gặp lại tin đã có dòng thì bỏ qua, không gửi email lần hai.
 
 ---
 
@@ -259,6 +269,13 @@ erDiagram
 - Consumer nhận → gửi email mã vé qua **Mailpit** (container hứng email để xem thử).
 - **Kiểm chứng:** tắt RabbitMQ, thanh toán một đơn, bật lại → email **vẫn tới**.
 
+**Hoàn thành khi:**
+- [x] 5.1 Tin `OrderPaid` ghi vào `outbox_messages` cùng transaction với đơn `Paid` và vé
+- [x] 5.2 `OutboxProcessor` gửi lên RabbitMQ (publisher confirms, `FOR UPDATE SKIP LOCKED`); broker chết thì tin nằm chờ, sống lại thì tự gửi
+- [x] 5.3 Consumer soạn và gửi email mã vé tới Mailpit, ack sau khi gửi
+- [x] 5.4 Tin giao lặp không gửi thư lần hai (`processed_messages`); lỗi tạm thời thử lại qua `ticket-emails.retry`, hết lượt hoặc hỏng hẳn → dead-letter
+- [x] 5.5 Ghi chú trong `notes.md`, cách thử trong README
+
 ### Ticket 6 — Cache
 
 - Cache `GET /events`, `GET /events/{id}` bằng Redis (`IDistributedCache`), TTL 60 giây; sửa sự kiện → **xoá cache** tương ứng.
@@ -321,7 +338,7 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Ticket 2 — Đặt vé, giữ chỗ (nhánh `ticket-2-orders`, chờ merge)
 - [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
 - [x] Ticket 4 — Thanh toán + idempotency (nhánh `ticket-4-payment`, chờ merge) → **cập nhật CV, bắt đầu nộp**
-- [ ] Ticket 5 — RabbitMQ + Outbox
+- [x] Ticket 5 — RabbitMQ + Outbox (nhánh `ticket-5-outbox`, chờ merge)
 - [ ] Ticket 6 — Cache
 - [ ] Ticket 7 — Đo tải k6
 - [ ] Ticket 8 — Deploy

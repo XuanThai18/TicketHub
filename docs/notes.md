@@ -418,4 +418,114 @@ webhook thành công
 
 - Soát vé (`Valid → Used`) và huỷ vé (`Cancelled`) khi huỷ sự kiện/hoàn tiền.
 - Hoàn tiền thật cho `RefundRequired`: chưa làm (mới chỉ đánh dấu).
-- Gửi vé qua email (Ticket 5).
+- ~~Gửi vé qua email~~: đã làm ở Ticket 5.
+
+---
+
+## Ticket 5: Email vé qua Outbox + RabbitMQ
+
+### 1. Bài toán: ghi DB và gửi tin là hai việc tách rời (dual write)
+
+Đơn chuyển `Paid` thì phải gửi email vé. Cách ngây thơ là commit DB rồi gửi tin lên RabbitMQ ngay trong handler webhook:
+
+| Thứ tự | Sự cố | Hậu quả |
+|---|---|---|
+| Commit rồi gửi tin | RabbitMQ chết, hoặc app sập ngay sau commit | Đơn `Paid`, vé có, **email không bao giờ đi** |
+| Gửi tin rồi commit | Commit lỗi (rollback) | Email báo vé cho một đơn **không hề `Paid`** |
+
+Không có transaction nào bao trùm cả Postgres lẫn RabbitMQ, nên đổi thứ tự cũng không cứu được.
+
+### 2. Outbox: ghi tin vào DB cùng transaction với đơn `Paid`
+
+```
+webhook thành công (một transaction)
+  a) chốt payment         b) đơn → Paid
+  c) phát vé              d) INSERT outbox_messages (OrderPaid { orderId, userId })   ← cùng commit
+                                   │
+OutboxProcessor (2 giây/lần) ──────┘ đọc tin chưa gửi → RabbitMQ → đánh dấu processed_at
+```
+
+- Commit thì có cả đơn `Paid` lẫn tin; rollback thì mất cả hai. Gửi lên RabbitMQ là việc **sau**, của job nền: RabbitMQ chết thì tin chỉ **nằm chờ** trong DB.
+- Tin chỉ chứa `orderId`, `userId`. Email, tên sự kiện, mã vé được tra **lúc gửi**: outbox và queue không giữ dữ liệu cá nhân, người mua đổi email trước khi thư đi thì vẫn tới địa chỉ mới.
+- `MessageId` của tin RabbitMQ = `id` dòng outbox (UUID v7), không đổi dù gửi lại bao nhiêu lần. Bên nhận dựa vào nó để chống trùng (mục 6).
+
+### 3. `OutboxProcessor`: quét định kỳ, `FOR UPDATE SKIP LOCKED`
+
+```sql
+SELECT * FROM outbox_messages WHERE processed_at IS NULL
+ORDER BY occurred_at LIMIT 50 FOR UPDATE SKIP LOCKED
+```
+
+- Chạy trong transaction: khoá các dòng vừa lấy tới khi commit. `SKIP LOCKED` để khi chạy nhiều instance (scale ngang, rolling deploy) mỗi bên lấy một phần khác nhau, thay vì gửi trùng hoặc đứng chờ nhau.
+- Index một phần `ix_outbox_messages_unprocessed` trên `occurred_at WHERE processed_at IS NULL`: tin đã gửi (đa số) không nằm trong index nên index luôn nhỏ.
+- Gửi lỗi → `attempts + 1`, ghi `last_error`, **dừng lô**: broker hỏng thì tin sau cũng hỏng; dừng lại để giữ thứ tự, lượt sau thử tiếp.
+- Gửi xong nhưng chưa kịp commit `processed_at` (app sập) → lượt sau gửi lại. Outbox đảm bảo **ít nhất một lần**, không phải đúng một lần; phần trùng do bên nhận lo.
+
+### 4. RabbitMQ
+
+```
+tickethub.events (direct) ──"OrderPaid"──▶ ticket-emails ──(hỏng hẳn / hết lượt)──▶ tickethub.dead-letter ──▶ ticket-emails.dead-letter
+                                              ▲     │
+                                (hết hạn chờ) │     │ (lỗi tạm thời)
+                                              └── ticket-emails.retry
+```
+
+- **Dùng thẳng `RabbitMQ.Client`, không dùng MassTransit:** mục tiêu là hiểu và trình bày được từng mảnh (confirm, ack, dead-letter, retry). MassTransit làm hết những việc này nhưng che đi chính phần đáng học.
+- `RabbitMqTopology.DeclareAsync` khai báo exchange/queue ở **một chỗ**, cả bên gửi lẫn bên nhận đều gọi (khai báo là idempotent). Tham số queue (`x-dead-letter-*`) không sửa được sau khi tạo (`PRECONDITION_FAILED`), nên khai báo đủ ngay từ đầu.
+- Bên gửi bật **publisher confirms** (chỉ đánh dấu `processed_at` khi broker xác nhận đã nhận), `mandatory: true` (không queue nào nhận thì báo lỗi thay vì vứt tin), `DeliveryMode = Persistent` (RabbitMQ khởi động lại không mất tin). Một kết nối + một channel dùng lại, khoá bằng `SemaphoreSlim` vì `IChannel` không an toàn đa luồng; lỗi thì bỏ kết nối, lần sau mở lại.
+- Consumer chạy **cùng process với API** (hosted service) cho đơn giản. Muốn tách thành worker riêng thì chỉ cần đăng ký `TicketEmailConsumer` ở host khác.
+
+### 5. Consumer: ack sau khi gửi thư
+
+- `autoAck: false`, `prefetch 10`. Gửi thư xong mới ack: app sập giữa chừng thì tin chưa ack, RabbitMQ giao lại.
+- Soạn thư (`GetTicketEmailQuery`, tầng Application) tách khỏi gửi thư (`IEmailSender`, MailKit + SMTP): query không có tác dụng phụ, mẫu thư (`TicketEmailTemplate.Build`) là hàm thuần nên unit test được; đổi SMTP sang dịch vụ khác không đụng tới handler.
+- Giờ diễn in theo giờ Việt Nam; tên sự kiện do người dùng nhập nên được `HtmlEncode` trước khi chèn vào bản HTML.
+- Dev/test dùng **Mailpit** (hộp thư giả, SMTP 1025, giao diện 8025).
+
+### 6. Chống gửi trùng: bảng `processed_messages`
+
+| Bước | Việc |
+|---|---|
+| 1 | Đã có dòng `(message_id, consumer)` → ack, bỏ qua |
+| 2 | Soạn thư, gửi |
+| 3 | `INSERT processed_messages` → ack |
+
+- **Ghi dấu SAU khi gửi**: sập giữa bước 2 và 3 thì lần sau gửi lại, người mua nhận **thừa một thư**. Ghi dấu trước thì sập giữa chừng là **mất thư**. Thừa vẫn hơn mất. Không thể "đúng một lần" thật sự vì SMTP không nằm chung transaction với DB.
+- Khoá chính `(message_id, consumer)`: cùng một tin sau này có thể tới nhiều consumer (email, thông báo...), mỗi bên đánh dấu phần của mình.
+
+### 7. Thử lại và dead-letter
+
+| Lỗi | Ví dụ | Xử lý |
+|---|---|---|
+| Hỏng hẳn | Thiếu/sai `MessageId`, JSON hỏng, đơn không tồn tại, người mua đã bị xoá | Nack → dead-letter **ngay**, thử lại cũng vô ích |
+| Tạm thời | Exception từ SMTP hoặc DB | Hẹn giờ thử lại; quá `MaxRetries` → dead-letter |
+
+- Thử lại = gửi **bản sao** sang `ticket-emails.retry` (header `x-retry-count + 1`, `Expiration` = `RetryDelay`) rồi ack bản gốc. Queue retry không ai đọc; hết hạn thì RabbitMQ dead-letter tin qua exchange mặc định về lại `ticket-emails`.
+- **Không dùng `Nack(requeue: true)`**: tin quay lại ngay lập tức, SMTP đang chết thì thành vòng lặp nóng, không có thời gian chờ và không đếm được số lần.
+- **Thời gian chờ cố định** (mặc định 30s × 5 lần), không tăng dần: RabbitMQ chỉ cho tin hết hạn khi nó ở **đầu** queue, nên tin chờ lâu đứng đầu sẽ giữ chân các tin chờ ngắn phía sau. Muốn chờ tăng dần thì cần nhiều queue retry (mỗi mức một queue) hoặc plugin delayed-message.
+- Bản sao được gửi qua channel có publisher confirms, broker xác nhận xong mới ack bản gốc. Sập giữa hai bước thì có hai bản; bản tới sau thấy dấu ở mục 6 và bỏ qua.
+
+### 8. Chứng minh
+
+| Test | Kiểm |
+|---|---|
+| `HandlePaymentWebhookTests` (unit) | Webhook thành công ghi tin `OrderPaid` vào outbox; webhook lặp và `RefundRequired` thì không |
+| `OutboxTests.OrderPaid_MessageIsMarkedProcessedAfterPublishing` | Tin được gửi lên RabbitMQ thật và đánh dấu `processed_at` |
+| `OutboxTests.BrokerDown_...` | Broker "chết": đơn vẫn `Paid`, tin nằm lại outbox, `attempts` tăng; broker sống lại thì tự gửi nốt |
+| `TicketEmailTests.OrderPaid_BuyerReceivesOneEmailWithEveryTicketCode` | Thanh toán → thư tới Mailpit, đủ 3 mã vé, đúng một thư |
+| `TicketEmailTests.SameMessageDeliveredTwice_...` | Đẩy thêm một bản cùng `MessageId`: không gửi thư lần hai. Tắt bước kiểm dấu → test đỏ (5 lần gửi thay vì 2) |
+| `TicketEmailTests.SmtpFailsTwice_...` | SMTP lỗi 2 lần → thử lại, cuối cùng đúng một thư |
+| `TicketEmailTests.SmtpKeepsFailing_...` | SMTP lỗi mãi → sau `MaxRetries` lần, tin nằm ở dead-letter với `x-retry-count` đúng |
+
+- "Broker chết" trong test là một lớp bọc publisher ném lỗi (`ControllablePublisher`), không tắt container thật: bật lại container thì Testcontainers thường cấp cổng mới và app không tìm thấy nữa. Thử với RabbitMQ thật: README, mục *Thử email vé*.
+- **Đã chạy tay với RabbitMQ thật** (`docker compose stop rabbitmq`): đơn vẫn `Paid`, outbox ghi `attempts = 1` với lỗi *None of the specified endpoints were reachable*, Mailpit 0 thư. `docker compose start rabbitmq` → khoảng 8 giây sau thư tới, `processed_at` có giá trị (4 lần thử). Consumer tự nối lại nhờ automatic recovery của RabbitMQ.Client, không phải khởi động lại app.
+- Lỗ bắt được trong chính test: bản đầu của test chống trùng chờ "đủ 2 thư" nên vẫn xanh khi tắt chống trùng (thư thứ hai chính là thư lặp). Đã sửa thành chờ đúng thư của đơn thứ hai theo mã đơn.
+
+### 9. Giới hạn đã biết
+
+- **Ít nhất một lần**, không phải đúng một lần (mục 6): hiếm, nhưng vẫn có thể thừa một thư.
+- `outbox_messages` và `processed_messages` chưa có job dọn nên bảng phình dần. Cần job xoá dòng đã xử lý quá N ngày.
+- Outbox không giới hạn số lần thử: một tin gửi mãi không được sẽ chặn các tin sau nó (vì dừng lô ở lỗi đầu). Lỗi gửi gần như luôn là lỗi broker nên chặn cả lô là đúng, nhưng chưa có cảnh báo khi `attempts` cao.
+- Dead-letter chưa có công cụ xem/gửi lại; hiện phải làm tay qua RabbitMQ Management UI.
+- Độ trễ email: tới 2 giây chờ lượt quét outbox, cộng thời gian gửi SMTP.
+- Mẫu thư đơn giản (chữ + HTML), chưa có mã QR.
