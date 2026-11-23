@@ -9,6 +9,7 @@ using DotNet.Testcontainers.Containers;
 using Testcontainers.PostgreSql;
 using Testcontainers.RabbitMq;
 using Testcontainers.Redis;
+using TicketHub.Application.Abstractions;
 using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Security;
 
@@ -44,6 +45,12 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     /// <summary>Bật <see cref="ControllablePublisher.BrokerDown"/> để giả lập RabbitMQ chết.</summary>
     public ControllablePublisher Publisher => Services.GetRequiredService<ControllablePublisher>();
+
+    /// <summary>Làm lỗi vài lần gửi email để kiểm luồng thử lại / dead-letter.</summary>
+    public ControllableEmailSender EmailSender => Services.GetRequiredService<ControllableEmailSender>();
+
+    /// <summary>Số lần thử lại email trong test (thật là 5, mỗi lần cách 30s; test rút còn 2 lần, cách 1s).</summary>
+    public const int TicketEmailMaxRetries = 2;
 
     public async ValueTask InitializeAsync()
     {
@@ -84,6 +91,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseSetting("ConnectionStrings:RabbitMq", _rabbitMq.GetConnectionString());
         builder.UseSetting("Smtp:Host", _mailpit.Hostname);
         builder.UseSetting("Smtp:Port", _mailpit.GetMappedPublicPort(1025).ToString(CultureInfo.InvariantCulture));
+        builder.UseSetting("TicketEmailConsumer:MaxRetries", TicketEmailMaxRetries.ToString(CultureInfo.InvariantCulture));
+        builder.UseSetting("TicketEmailConsumer:RetryDelay", "00:00:01");
         builder.UseSetting("JwtSettings:Secret", "integration-test-secret-0123456789abcdef");
         builder.UseSetting("Payments:WebhookSecret", WebhookSecret);
         builder.UseSetting("Database:MigrateOnStartup", "true");
@@ -92,15 +101,23 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         // 0 giây: dùng lại token đã đổi là bị coi như đánh cắp ngay → kiểm được luồng thu hồi cả họ phiên.
         builder.UseSetting("Auth:RefreshReuseGraceSeconds", "0");
 
-        // Bọc publisher thật trong ControllablePublisher để test giả lập được RabbitMQ chết.
+        // Bọc publisher và bộ gửi email thật để test giả lập được RabbitMQ chết, máy chủ thư lỗi.
         builder.ConfigureTestServices(services =>
         {
-            var original = services.Single(d => d.ServiceType == typeof(IMessagePublisher));
-            services.Remove(original);
-            services.AddSingleton(sp => new ControllablePublisher(
-                (IMessagePublisher)ActivatorUtilities.CreateInstance(sp, original.ImplementationType!)));
-            services.AddSingleton<IMessagePublisher>(sp => sp.GetRequiredService<ControllablePublisher>());
+            Decorate<IMessagePublisher, ControllablePublisher>(services, inner => new ControllablePublisher(inner));
+            Decorate<IEmailSender, ControllableEmailSender>(services, inner => new ControllableEmailSender(inner));
         });
+    }
+
+    // Thay đăng ký TService bằng TWrapper bọc bản thật; test lấy TWrapper ra để điều khiển.
+    private static void Decorate<TService, TWrapper>(IServiceCollection services, Func<TService, TWrapper> wrap)
+        where TService : class
+        where TWrapper : class, TService
+    {
+        var original = services.Single(d => d.ServiceType == typeof(TService));
+        services.Remove(original);
+        services.AddSingleton(sp => wrap((TService)ActivatorUtilities.CreateInstance(sp, original.ImplementationType!)));
+        services.AddSingleton<TService>(sp => sp.GetRequiredService<TWrapper>());
     }
 
     /// <summary>Client HTTPS có giữ cookie: cookie refresh token gắn cờ Secure nên chỉ gửi qua https.</summary>

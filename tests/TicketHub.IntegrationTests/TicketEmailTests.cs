@@ -1,5 +1,10 @@
+using System.Globalization;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using RabbitMQ.Client;
 using TicketHub.Api.Contracts.Auth;
 using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Events;
@@ -7,17 +12,21 @@ using TicketHub.Api.Contracts.Orders;
 using TicketHub.Application.Events;
 using TicketHub.Application.Orders;
 using TicketHub.Domain.Common;
+using TicketHub.Domain.Outbox;
+using TicketHub.Infrastructure.Messaging;
+using TicketHub.Infrastructure.Persistence.Contexts;
 
 namespace TicketHub.IntegrationTests;
 
 /// <summary>
-/// Email vé (Ticket 5.3), đi hết đường thật: thanh toán → outbox → RabbitMQ → consumer → SMTP → Mailpit.
-/// Kiểm bằng HTTP API của Mailpit: thư tới đúng người mua, có đủ mã vé.
+/// Email vé (Ticket 5.3–5.4), đi hết đường thật: thanh toán → outbox → RabbitMQ → consumer → SMTP → Mailpit.
+/// Kiểm bằng HTTP API của Mailpit: thư tới đúng người mua, có đủ mã vé, không gửi lặp, lỗi tạm thời được thử lại.
 /// </summary>
 public sealed class TicketEmailTests(ApiFactory factory)
 {
     private const string Events = "/api/v1/events";
     private const string Orders = "/api/v1/orders";
+    private const string RetryCountHeader = "x-retry-count"; // = TicketEmailConsumer.RetryCountHeader (internal)
     private static readonly TimeSpan _timeout = TimeSpan.FromSeconds(30);
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
@@ -42,6 +51,59 @@ public sealed class TicketEmailTests(ApiFactory factory)
         // Đợi thêm vài lượt quét: vẫn chỉ đúng một email, không gửi lặp.
         await Task.Delay(TimeSpan.FromSeconds(5), Ct);
         Assert.Equal(1, await CountEmailsAsync(email));
+    }
+
+    [Fact]
+    public async Task SameMessageDeliveredTwice_EmailIsSentOnlyOnce()
+    {
+        var (buyer, email) = await CreateBuyerAsync();
+        using var _ = buyer;
+        var firstOrderId = await PlaceAndPayOrderAsync(buyer, quantity: 1);
+        await WaitForEmailAsync(email);
+
+        // Giả lập RabbitMQ giao lặp: đẩy thêm một bản y hệt (cùng MessageId) vào exchange.
+        await PublishCopyAsync(await OutboxMessageAsync(firstOrderId));
+
+        // Đơn thứ hai đi qua outbox nên vào queue SAU bản lặp; consumer xử lý lần lượt,
+        // nên khi thư đơn hai tới thì bản lặp chắc chắn đã được xử lý xong.
+        // Phải chờ đúng thư của đơn hai (theo mã đơn): chờ "đủ 2 thư" thì thư thứ hai có thể chính là thư gửi lặp.
+        var secondOrderId = await PlaceAndPayOrderAsync(buyer, quantity: 1);
+        var secondOrder = await buyer.GetFromJsonAsync<OrderDetailResponse>($"{Orders}/{secondOrderId}", Ct);
+        (await WaitForEmailCountAsync(email, 1, subject: secondOrder!.Code)).Dispose();
+
+        Assert.Equal(2, factory.EmailSender.Attempts(email)); // bản lặp không hề thử gửi
+        Assert.Equal(2, await CountEmailsAsync(email));
+    }
+
+    [Fact]
+    public async Task SmtpFailsTwice_MessageIsRetried_ThenEmailIsSent()
+    {
+        var (buyer, email) = await CreateBuyerAsync();
+        using var _ = buyer;
+        factory.EmailSender.FailNext(email, times: 2);
+
+        await PlaceAndPayOrderAsync(buyer, quantity: 1);
+        await WaitForEmailAsync(email);
+
+        Assert.Equal(3, factory.EmailSender.Attempts(email)); // lỗi, lỗi, thành công
+        Assert.Equal(1, await CountEmailsAsync(email));
+    }
+
+    [Fact]
+    public async Task SmtpKeepsFailing_MessageGoesToDeadLetterAfterMaxRetries()
+    {
+        var (buyer, email) = await CreateBuyerAsync();
+        using var _ = buyer;
+        factory.EmailSender.FailNext(email, times: int.MaxValue);
+
+        var orderId = await PlaceAndPayOrderAsync(buyer, quantity: 1);
+        var outbox = await OutboxMessageAsync(orderId);
+
+        var deadLetter = await WaitForDeadLetterAsync(outbox.Id.ToString());
+        Assert.Equal(ApiFactory.TicketEmailMaxRetries,
+            Convert.ToInt32(deadLetter.Headers![RetryCountHeader], CultureInfo.InvariantCulture));
+        Assert.Equal(ApiFactory.TicketEmailMaxRetries + 1, factory.EmailSender.Attempts(email)); // lần đầu + các lần thử lại
+        Assert.Equal(0, await CountEmailsAsync(email));
     }
 
     // ---------- Helpers ----------
@@ -82,23 +144,80 @@ public sealed class TicketEmailTests(ApiFactory factory)
         return orderId;
     }
 
+    // Dòng outbox được ghi cùng transaction với lúc đơn chuyển Paid, nên có ngay sau khi thanh toán xong.
+    private async Task<OutboxMessage> OutboxMessageAsync(Guid orderId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.Set<OutboxMessage>()
+            .FromSql($"SELECT * FROM outbox_messages WHERE payload->>'orderId' = {orderId.ToString()}")
+            .AsNoTracking()
+            .SingleAsync(Ct);
+    }
+
+    private async Task PublishCopyAsync(OutboxMessage message)
+    {
+        await using var connection = await RabbitMqConnectionFactory().CreateConnectionAsync(Ct);
+        await using var channel = await connection.CreateChannelAsync(
+            new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true), Ct);
+        var properties = new BasicProperties
+        {
+            MessageId = message.Id.ToString(),
+            ContentType = "application/json",
+            DeliveryMode = DeliveryModes.Persistent
+        };
+        await channel.BasicPublishAsync(RabbitMqTopology.Exchange, message.Type, mandatory: true,
+            properties, Encoding.UTF8.GetBytes(message.Payload), Ct);
+    }
+
+    // Đọc queue dead-letter tới khi gặp tin cần tìm. Tin của test khác (người mua giả) cũng nằm đây: lấy ra rồi bỏ qua.
+    private async Task<IReadOnlyBasicProperties> WaitForDeadLetterAsync(string messageId)
+    {
+        await using var connection = await RabbitMqConnectionFactory().CreateConnectionAsync(Ct);
+        await using var channel = await connection.CreateChannelAsync(cancellationToken: Ct);
+
+        var deadline = DateTimeOffset.UtcNow + _timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var result = await channel.BasicGetAsync(RabbitMqTopology.TicketEmailsDeadLetterQueue, autoAck: true, Ct);
+            if (result is null)
+            {
+                await Task.Delay(250, Ct);
+            }
+            else if (result.BasicProperties.MessageId == messageId)
+            {
+                return result.BasicProperties;
+            }
+        }
+
+        throw new TimeoutException($"Message {messageId} did not reach the dead-letter queue within {_timeout.TotalSeconds}s.");
+    }
+
+    private ConnectionFactory RabbitMqConnectionFactory() => new() { Uri = new Uri(factory.RabbitMqConnectionString) };
+
     // Hỏi Mailpit mỗi 500 ms tới khi có thư gửi tới địa chỉ này; trả về Id thư.
     private async Task<string> WaitForEmailAsync(string email)
+    {
+        using var search = await WaitForEmailCountAsync(email, 1);
+        return search.RootElement.GetProperty("messages")[0].GetProperty("ID").GetString()!;
+    }
+
+    private async Task<JsonDocument> WaitForEmailCountAsync(string email, int count, string? subject = null)
     {
         var deadline = DateTimeOffset.UtcNow + _timeout;
         while (DateTimeOffset.UtcNow < deadline)
         {
-            using var search = await SearchAsync(email);
-            var messages = search.RootElement.GetProperty("messages");
-            if (messages.GetArrayLength() > 0)
+            var search = await SearchAsync(email, subject);
+            if (search.RootElement.GetProperty("messages").GetArrayLength() >= count)
             {
-                return messages[0].GetProperty("ID").GetString()!;
+                return search;
             }
 
+            search.Dispose();
             await Task.Delay(500, Ct);
         }
 
-        throw new TimeoutException($"No email to {email} within {_timeout.TotalSeconds}s.");
+        throw new TimeoutException($"Fewer than {count} email(s) to {email} within {_timeout.TotalSeconds}s.");
     }
 
     private async Task<int> CountEmailsAsync(string email)
@@ -107,8 +226,12 @@ public sealed class TicketEmailTests(ApiFactory factory)
         return search.RootElement.GetProperty("messages").GetArrayLength();
     }
 
-    private Task<JsonDocument> SearchAsync(string email) =>
-        GetJsonAsync($"/api/v1/search?query={Uri.EscapeDataString($"to:\"{email}\"")}");
+    // Cú pháp tìm của Mailpit: to:"địa chỉ" subject:"chữ trong tiêu đề".
+    private Task<JsonDocument> SearchAsync(string email, string? subject = null)
+    {
+        var query = subject is null ? $"to:\"{email}\"" : $"to:\"{email}\" subject:\"{subject}\"";
+        return GetJsonAsync($"/api/v1/search?query={Uri.EscapeDataString(query)}");
+    }
 
     private async Task<JsonDocument> GetJsonAsync(string path)
     {

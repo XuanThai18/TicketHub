@@ -7,12 +7,16 @@ namespace TicketHub.Infrastructure.Messaging;
 /// Tên exchange/queue và cách nối chúng, khai báo ở MỘT chỗ cho cả bên gửi lẫn bên nhận.
 /// <code>
 /// tickethub.events (direct) --"OrderPaid"--> ticket-emails --(hỏng quá số lần)--> tickethub.dead-letter --> ticket-emails.dead-letter
+///                                               ↑    │
+///                                 (hết hạn chờ) │    │ (lỗi tạm thời)
+///                                               └── ticket-emails.retry
 /// </code>
 /// </summary>
 public static class RabbitMqTopology
 {
     public const string Exchange = "tickethub.events";
     public const string TicketEmailsQueue = "ticket-emails";
+    public const string TicketEmailsRetryQueue = "ticket-emails.retry";
     public const string DeadLetterExchange = "tickethub.dead-letter";
     public const string TicketEmailsDeadLetterQueue = "ticket-emails.dead-letter";
 
@@ -33,8 +37,18 @@ public static class RabbitMqTopology
         await channel.QueueBindAsync(TicketEmailsDeadLetterQueue, DeadLetterExchange, TicketEmailsQueue,
             cancellationToken: cancellationToken);
 
+        // Queue "phòng chờ" thử lại: không ai đọc. Tin nằm đây tới hết hạn (consumer đặt Expiration) thì RabbitMQ
+        // dead-letter nó qua exchange mặc định ("") với routing key = tên queue, tức là về thẳng ticket-emails.
+        var retryArguments = new Dictionary<string, object?>
+        {
+            ["x-dead-letter-exchange"] = string.Empty,
+            ["x-dead-letter-routing-key"] = TicketEmailsQueue
+        };
+        await channel.QueueDeclareAsync(TicketEmailsRetryQueue, durable: true, exclusive: false, autoDelete: false,
+            arguments: retryArguments, cancellationToken: cancellationToken);
+
         // Tin bị consumer từ chối (nack, không requeue) sẽ chuyển sang dead-letter thay vì mất.
-        // Tham số của queue không sửa được sau khi tạo, nên khai báo luôn từ bây giờ dù 5.4 mới dùng.
+        // Tham số của queue không sửa được sau khi tạo, nên khai báo ngay từ đầu.
         var arguments = new Dictionary<string, object?>
         {
             ["x-dead-letter-exchange"] = DeadLetterExchange,

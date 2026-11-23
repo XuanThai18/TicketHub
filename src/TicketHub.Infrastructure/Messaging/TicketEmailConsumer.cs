@@ -1,26 +1,39 @@
+using System.Globalization;
 using System.Text.Json;
 using MediatR;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Messaging;
 using TicketHub.Application.Tickets;
+using TicketHub.Infrastructure.Persistence.Contexts;
 
 namespace TicketHub.Infrastructure.Messaging;
 
 /// <summary>
 /// Nghe queue ticket-emails: mỗi tin OrderPaid → soạn email vé → gửi → ack.
 /// Chỉ ack SAU khi gửi xong: app sập giữa chừng thì tin chưa ack, RabbitMQ giao lại cho lần chạy sau.
+/// Tin giao lại mà đã gửi rồi thì bỏ qua (processed_messages); lỗi tạm thời thì hẹn giờ thử lại; hỏng hẳn thì sang dead-letter.
 /// </summary>
 internal sealed class TicketEmailConsumer(
     ConnectionFactory connectionFactory,
     IServiceScopeFactory scopeFactory,
     IEmailSender emailSender,
+    IOptions<TicketEmailConsumerOptions> options,
+    TimeProvider timeProvider,
     ILogger<TicketEmailConsumer> logger) : BackgroundService
 {
+    /// <summary>Tên ghi vào processed_messages.consumer.</summary>
+    internal const string ConsumerName = "ticket-emails";
+
+    /// <summary>Header đếm số lần tin đã được thử lại.</summary>
+    internal const string RetryCountHeader = "x-retry-count";
+
     private static readonly TimeSpan _reconnectDelay = TimeSpan.FromSeconds(5);
     private const ushort PrefetchCount = 10;
 
@@ -52,7 +65,11 @@ internal sealed class TicketEmailConsumer(
     private async Task ConsumeAsync(CancellationToken stoppingToken)
     {
         await using var connection = await connectionFactory.CreateConnectionAsync("TicketHub.TicketEmailConsumer", stoppingToken);
-        await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+
+        // Bật publisher confirms: khi chuyển tin sang queue thử lại, phải chắc RabbitMQ đã nhận bản sao rồi mới ack bản gốc.
+        await using var channel = await connection.CreateChannelAsync(
+            new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true),
+            stoppingToken);
         await RabbitMqTopology.DeclareAsync(channel, stoppingToken);
 
         // Mỗi lần nhận tối đa 10 tin chưa ack; tránh RabbitMQ dồn cả nghìn tin vào một consumer.
@@ -77,39 +94,143 @@ internal sealed class TicketEmailConsumer(
         var messageId = delivery.BasicProperties.MessageId;
         try
         {
-            var message = JsonSerializer.Deserialize<OrderPaidMessage>(delivery.Body.Span, JsonSerializerOptions.Web)
-                ?? throw new JsonException("Message body is empty.");
-
-            // Consumer là singleton còn DbContext là scoped: mỗi tin một scope riêng.
-            await using var scope = scopeFactory.CreateAsyncScope();
-            var sender = scope.ServiceProvider.GetRequiredService<ISender>();
-            var email = await sender.Send(new GetTicketEmailQuery(message.OrderId), stoppingToken);
-            if (email.IsFailure)
+            var rejectReason = await ProcessAsync(messageId, delivery.Body, stoppingToken);
+            if (rejectReason is null)
             {
-                // Không soạn được (đơn không tồn tại, người mua đã bị xoá...): thử lại cũng vô ích → chuyển sang dead-letter.
-                if (logger.IsEnabled(LogLevel.Warning))
-                {
-                    logger.LogWarning("Cannot build ticket email for message {MessageId}: {Error}. Sending to dead-letter.",
-                        messageId, email.Error.Message);
-                }
-
-                await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: false, stoppingToken);
+                await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false, stoppingToken);
                 return;
             }
 
-            await emailSender.SendAsync(email.Value, stoppingToken);
-            await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false, stoppingToken);
-
-            if (logger.IsEnabled(LogLevel.Information))
+            // Tin hỏng hẳn (sai định dạng, đơn không tồn tại, người mua đã bị xoá...): thử lại cũng vô ích.
+            if (logger.IsEnabled(LogLevel.Warning))
             {
-                logger.LogInformation("Sent ticket email for order {OrderId} (message {MessageId}).", message.OrderId, messageId);
+                logger.LogWarning("Rejecting ticket email message {MessageId}: {Reason}. Sending to dead-letter.", messageId, rejectReason);
             }
+
+            await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: false, stoppingToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Bước 5.4 sẽ thêm thử lại cho lỗi tạm thời (máy chủ thư chập chờn); tạm thời chuyển thẳng sang dead-letter để không lặp vô hạn.
-            logger.LogError(ex, "Failed to process ticket email message {MessageId}. Sending to dead-letter.", messageId);
-            await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: false, stoppingToken);
+            // Lỗi tạm thời (máy chủ thư chập chờn, DB mất kết nối): hẹn giờ thử lại.
+            await RetryOrDeadLetterAsync(channel, delivery, ex, stoppingToken);
         }
     }
+
+    /// <summary>
+    /// Trả về null nếu xong việc (vừa gửi, hoặc tin lặp đã gửi từ trước); trả về lý do nếu tin hỏng hẳn.
+    /// Ném exception nghĩa là lỗi tạm thời, đáng thử lại.
+    /// </summary>
+    private async Task<string?> ProcessAsync(string? messageIdText, ReadOnlyMemory<byte> body, CancellationToken cancellationToken)
+    {
+        if (!Guid.TryParse(messageIdText, out var messageId))
+        {
+            return "missing or invalid MessageId";
+        }
+
+        OrderPaidMessage? message;
+        try
+        {
+            message = JsonSerializer.Deserialize<OrderPaidMessage>(body.Span, JsonSerializerOptions.Web);
+        }
+        catch (JsonException ex)
+        {
+            return $"invalid JSON ({ex.Message})";
+        }
+
+        if (message is null)
+        {
+            return "empty body";
+        }
+
+        // Consumer là singleton còn DbContext là scoped: mỗi tin một scope riêng.
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        var processedMessages = dbContext.Set<ProcessedMessage>();
+
+        // Tin đã xử lý mà tới lại (app sập trước khi kịp ack, outbox gửi lặp): bỏ qua, ack để RabbitMQ xoá.
+        if (await processedMessages.AnyAsync(p => p.MessageId == messageId && p.Consumer == ConsumerName, cancellationToken))
+        {
+            if (logger.IsEnabled(LogLevel.Information))
+            {
+                logger.LogInformation("Message {MessageId} was already processed; skipping.", messageId);
+            }
+
+            return null;
+        }
+
+        var email = await scope.ServiceProvider.GetRequiredService<ISender>()
+            .Send(new GetTicketEmailQuery(message.OrderId), cancellationToken);
+        if (email.IsFailure)
+        {
+            return email.Error.Message;
+        }
+
+        await emailSender.SendAsync(email.Value, cancellationToken);
+
+        // Ghi dấu SAU khi gửi: sập giữa hai bước thì lần sau gửi lại (thừa một thư), còn hơn ghi trước rồi mất thư.
+        processedMessages.Add(ProcessedMessage.Create(messageId, ConsumerName, timeProvider.GetUtcNow()));
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation("Sent ticket email for order {OrderId} (message {MessageId}).", message.OrderId, messageId);
+        }
+
+        return null;
+    }
+
+    private async Task RetryOrDeadLetterAsync(IChannel channel, BasicDeliverEventArgs delivery, Exception error, CancellationToken cancellationToken)
+    {
+        var settings = options.Value;
+        var messageId = delivery.BasicProperties.MessageId;
+        var retryCount = GetRetryCount(delivery.BasicProperties);
+
+        if (retryCount >= settings.MaxRetries)
+        {
+            logger.LogError(error, "Ticket email message {MessageId} failed after {RetryCount} retries. Sending to dead-letter.",
+                messageId, retryCount);
+            await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: false, cancellationToken);
+            return;
+        }
+
+        var properties = new BasicProperties
+        {
+            MessageId = messageId,
+            Type = delivery.BasicProperties.Type,
+            ContentType = delivery.BasicProperties.ContentType,
+            Timestamp = delivery.BasicProperties.Timestamp,
+            DeliveryMode = DeliveryModes.Persistent,
+            Headers = new Dictionary<string, object?> { [RetryCountHeader] = retryCount + 1 },
+            // Tin nằm trong queue thử lại đúng chừng này mili giây rồi RabbitMQ đẩy về ticket-emails.
+            Expiration = ((long)settings.RetryDelay.TotalMilliseconds).ToString(CultureInfo.InvariantCulture)
+        };
+
+        try
+        {
+            // Gửi bản sao sang queue thử lại (exchange mặc định "", routing key = tên queue) RỒI mới ack bản gốc.
+            // Sập giữa hai bước thì có hai bản; bản tới sau thấy dấu đã xử lý và bỏ qua.
+            await channel.BasicPublishAsync(string.Empty, RabbitMqTopology.TicketEmailsRetryQueue, mandatory: true,
+                properties, delivery.Body, cancellationToken);
+            await channel.BasicAckAsync(delivery.DeliveryTag, multiple: false, cancellationToken);
+        }
+        catch (Exception publishError) when (publishError is not OperationCanceledException)
+        {
+            // Không chuyển được sang queue thử lại: trả tin về queue chính, không để mất.
+            logger.LogError(publishError, "Could not schedule a retry for message {MessageId}; requeueing it.", messageId);
+            await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: true, cancellationToken);
+            return;
+        }
+
+        if (logger.IsEnabled(LogLevel.Warning))
+        {
+            logger.LogWarning(error, "Ticket email message {MessageId} failed; retry {Attempt}/{MaxRetries} in {Delay}.",
+                messageId, retryCount + 1, settings.MaxRetries, settings.RetryDelay);
+        }
+    }
+
+    // Tin mới từ outbox chưa có header → 0. RabbitMQ trả số nguyên AMQP về dưới dạng int hoặc long tuỳ lúc.
+    private static int GetRetryCount(IReadOnlyBasicProperties properties) =>
+        properties.Headers is not null && properties.Headers.TryGetValue(RetryCountHeader, out var value) && value is not null
+            ? Convert.ToInt32(value, CultureInfo.InvariantCulture)
+            : 0;
 }

@@ -67,6 +67,10 @@ public static class DependencyInjection
             .ValidateDataAnnotations()
             .ValidateOnStart();
         services.AddSingleton<IEmailSender, SmtpEmailSender>();
+        services.AddOptions<TicketEmailConsumerOptions>()
+            .BindConfiguration(TicketEmailConsumerOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
         services.AddHostedService<TicketEmailConsumer>();
 
         // Thiếu khoá webhook (hoặc khoá ngắn) thì app không khởi động, thay vì chạy rồi mới từ chối mọi webhook.
