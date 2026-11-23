@@ -1,9 +1,6 @@
 using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using RabbitMQ.Client;
 using TicketHub.Api.Contracts.Common;
 using TicketHub.Api.Contracts.Events;
 using TicketHub.Api.Contracts.Orders;
@@ -11,7 +8,6 @@ using TicketHub.Application.Events;
 using TicketHub.Application.Messaging;
 using TicketHub.Domain.Common;
 using TicketHub.Domain.Outbox;
-using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Persistence.Contexts;
 
 namespace TicketHub.IntegrationTests;
@@ -28,7 +24,7 @@ public sealed class OutboxTests(ApiFactory factory)
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     [Fact]
-    public async Task OrderPaid_MessageIsPublishedToTicketEmailsQueue()
+    public async Task OrderPaid_MessageIsMarkedProcessedAfterPublishing()
     {
         var orderId = await PlaceAndPayOrderAsync();
 
@@ -36,12 +32,6 @@ public sealed class OutboxTests(ApiFactory factory)
         var message = await WaitForAsync(async () => await OutboxMessageAsync(orderId) is { ProcessedAt: not null } m ? m : null);
 
         Assert.Equal((OrderPaidMessage.Type, 0, null), (message.Type, message.Attempts, message.LastError));
-
-        // Tin thật sự nằm trong queue ticket-emails, mang đúng MessageId = Id dòng outbox.
-        var delivered = await WaitForAsync(() => FindInQueueAsync(message.Id));
-        Assert.Equal(OrderPaidMessage.Type, delivered.Type);
-        var payload = JsonSerializer.Deserialize<OrderPaidMessage>(delivered.Body, JsonSerializerOptions.Web);
-        Assert.Equal(orderId, payload!.OrderId);
     }
 
     [Fact]
@@ -121,24 +111,6 @@ public sealed class OutboxTests(ApiFactory factory)
         return await db.Set<OutboxMessage>().Where(m => m.ProcessedAt == null).SumAsync(m => m.Attempts, Ct);
     }
 
-    // Đọc (và lấy luôn ra khỏi queue) từng tin cho tới khi gặp tin có MessageId cần tìm.
-    private async Task<QueuedMessage?> FindInQueueAsync(Guid messageId)
-    {
-        var connectionFactory = new ConnectionFactory { Uri = new Uri(factory.RabbitMqConnectionString) };
-        await using var connection = await connectionFactory.CreateConnectionAsync(Ct);
-        await using var channel = await connection.CreateChannelAsync(cancellationToken: Ct);
-
-        while (await channel.BasicGetAsync(RabbitMqTopology.TicketEmailsQueue, autoAck: true, Ct) is { } result)
-        {
-            if (result.BasicProperties.MessageId == messageId.ToString())
-            {
-                return new QueuedMessage(result.BasicProperties.Type, Encoding.UTF8.GetString(result.Body.Span));
-            }
-        }
-
-        return null;
-    }
-
     // Hỏi lại mỗi 250 ms cho tới khi probe trả khác null (job nền chạy theo nhịp, không biết chính xác lúc nào xong).
     private static async Task<T> WaitForAsync<T>(Func<Task<T?>> probe) where T : class
     {
@@ -156,5 +128,4 @@ public sealed class OutboxTests(ApiFactory factory)
         throw new TimeoutException($"Condition not met within {_timeout.TotalSeconds}s.");
     }
 
-    private sealed record QueuedMessage(string? Type, string Body);
 }

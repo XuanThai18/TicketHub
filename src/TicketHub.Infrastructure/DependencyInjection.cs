@@ -6,6 +6,7 @@ using RabbitMQ.Client;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Payments;
 using TicketHub.Infrastructure.Auth;
+using TicketHub.Infrastructure.Email;
 using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Orders;
 using TicketHub.Infrastructure.Persistence;
@@ -59,6 +60,14 @@ public static class DependencyInjection
         services.AddSingleton(new ConnectionFactory { Uri = new Uri(rabbitMqConnectionString) });
         services.AddSingleton<IMessagePublisher, RabbitMqPublisher>();
         services.AddHostedService<OutboxProcessor>();
+
+        // Bên nhận: đọc queue ticket-emails rồi gửi email vé qua SMTP (dev: Mailpit).
+        services.AddOptions<SmtpOptions>()
+            .BindConfiguration(SmtpOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+        services.AddSingleton<IEmailSender, SmtpEmailSender>();
+        services.AddHostedService<TicketEmailConsumer>();
 
         // Thiếu khoá webhook (hoặc khoá ngắn) thì app không khởi động, thay vì chạy rồi mới từ chối mọi webhook.
         services.AddOptions<PaymentOptions>()

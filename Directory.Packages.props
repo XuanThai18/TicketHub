@@ -35,6 +35,7 @@
 
   <ItemGroup Label="Messaging">
     <PackageVersion Include="RabbitMQ.Client" Version="7.2.2" />
+    <PackageVersion Include="MailKit" Version="4.18.2" />
   </ItemGroup>
 
   <ItemGroup Label="Application">

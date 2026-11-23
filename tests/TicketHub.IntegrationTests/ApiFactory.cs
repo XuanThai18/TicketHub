@@ -1,8 +1,11 @@
+using System.Globalization;
 using System.Net.Http.Headers;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using DotNet.Testcontainers.Builders;
+using DotNet.Testcontainers.Containers;
 using Testcontainers.PostgreSql;
 using Testcontainers.RabbitMq;
 using Testcontainers.Redis;
@@ -14,7 +17,7 @@ using TicketHub.Infrastructure.Security;
 namespace TicketHub.IntegrationTests;
 
 /// <summary>
-/// Dựng API thật trên Postgres + Redis + RabbitMQ chạy trong container (cần Docker).
+/// Dựng API thật trên Postgres + Redis + RabbitMQ + Mailpit chạy trong container (cần Docker).
 /// Một instance cho cả assembly: container khởi động một lần, mỗi test tự sinh dữ liệu riêng (SKU ngẫu nhiên).
 /// </summary>
 public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
@@ -26,6 +29,16 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     private readonly RedisContainer _redis = new RedisBuilder("redis:7-alpine").Build();
     private readonly RabbitMqContainer _rabbitMq = new RabbitMqBuilder("rabbitmq:4-alpine").Build();
 
+    // Mailpit: hộp thư giả nhận email qua SMTP (1025), test đọc thư qua HTTP API (8025).
+    private readonly IContainer _mailpit = new ContainerBuilder("axllent/mailpit:v1.34")
+        .WithPortBinding(1025, assignRandomHostPort: true)
+        .WithPortBinding(8025, assignRandomHostPort: true)
+        .WithWaitStrategy(Wait.ForUnixContainer().UntilHttpRequestIsSucceeded(r => r.ForPort(8025).ForPath("/livez")))
+        .Build();
+
+    /// <summary>Địa chỉ HTTP API của Mailpit, để test kiểm email đã tới.</summary>
+    public Uri MailpitApi => new($"http://{_mailpit.Hostname}:{_mailpit.GetMappedPublicPort(8025)}");
+
     /// <summary>Để test tự kết nối RabbitMQ đọc tin trong queue.</summary>
     public string RabbitMqConnectionString => _rabbitMq.GetConnectionString();
 
@@ -34,7 +47,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
-        await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync(), _rabbitMq.StartAsync());
+        await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync(), _rabbitMq.StartAsync(), _mailpit.StartAsync());
 
         // Khởi động host MỘT lần ở đây. Nếu để test song song cùng gọi CreateClient() lần đầu,
         // Program chạy hai lần đồng thời và bootstrap logger tĩnh của Serilog bị freeze hai lần.
@@ -47,6 +60,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         await _postgres.DisposeAsync();
         await _redis.DisposeAsync();
         await _rabbitMq.DisposeAsync();
+        await _mailpit.DisposeAsync();
     }
 
     public HttpClient CreateAuthenticatedClient(params string[] roles) =>
@@ -68,6 +82,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseSetting("ConnectionStrings:DefaultConnection", _postgres.GetConnectionString());
         builder.UseSetting("ConnectionStrings:Redis", _redis.GetConnectionString());
         builder.UseSetting("ConnectionStrings:RabbitMq", _rabbitMq.GetConnectionString());
+        builder.UseSetting("Smtp:Host", _mailpit.Hostname);
+        builder.UseSetting("Smtp:Port", _mailpit.GetMappedPublicPort(1025).ToString(CultureInfo.InvariantCulture));
         builder.UseSetting("JwtSettings:Secret", "integration-test-secret-0123456789abcdef");
         builder.UseSetting("Payments:WebhookSecret", WebhookSecret);
         builder.UseSetting("Database:MigrateOnStartup", "true");
