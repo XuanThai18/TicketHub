@@ -1,11 +1,14 @@
 using System.Globalization;
 using System.Data;
+using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NSubstitute;
 using TicketHub.Application.Abstractions;
+using TicketHub.Application.Messaging;
 using TicketHub.Application.Payments;
 using TicketHub.Domain.Orders;
+using TicketHub.Domain.Outbox;
 using TicketHub.Domain.Payments;
 using TicketHub.Domain.Shared;
 using TicketHub.Domain.Tickets;
@@ -21,6 +24,7 @@ public sealed class HandlePaymentWebhookTests
     private readonly IPaymentRepository _payments = Substitute.For<IPaymentRepository>();
     private readonly IOrderRepository _orders = Substitute.For<IOrderRepository>();
     private readonly ITicketRepository _tickets = Substitute.For<ITicketRepository>();
+    private readonly IOutboxRepository _outbox = Substitute.For<IOutboxRepository>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
     private readonly TicketType _vip = TicketType.Create(Guid.NewGuid(), "VIP", null, 500_000m, totalQuantity: 10, maxQuantityPerOrder: 4).Value;
     private readonly TicketType _normal;
@@ -47,7 +51,7 @@ public sealed class HandlePaymentWebhookTests
 
     private HandlePaymentWebhookCommandHandler Handler() => new(
         Options.Create(new PaymentOptions { WebhookSecret = Secret }),
-        _payments, _orders, _tickets, _unitOfWork, new FixedTimeProvider(_now),
+        _payments, _orders, _tickets, _outbox, _unitOfWork, new FixedTimeProvider(_now),
         NullLogger<HandlePaymentWebhookCommandHandler>.Instance);
 
     // Webhook do "cổng" ký đúng khoá.
@@ -87,6 +91,20 @@ public sealed class HandlePaymentWebhookTests
     }
 
     [Fact]
+    public async Task Handle_Succeeded_QueuesOrderPaidMessageInOutbox()
+    {
+        OutboxMessage? queued = null;
+        _outbox.When(o => o.Add(Arg.Any<OutboxMessage>())).Do(ci => queued = ci.Arg<OutboxMessage>());
+
+        await Handler().Handle(Signed(Body("succeeded")), CancellationToken.None);
+
+        Assert.NotNull(queued);
+        Assert.Equal((OrderPaidMessage.Type, _now, (DateTimeOffset?)null, 0), (queued.Type, queued.OccurredAt, queued.ProcessedAt, queued.Attempts));
+        var message = JsonSerializer.Deserialize<OrderPaidMessage>(queued.Payload, JsonSerializerOptions.Web);
+        Assert.Equal(new OrderPaidMessage(_order.Id, _order.UserId), message);
+    }
+
+    [Fact]
     public async Task Handle_AlreadyProcessed_ReturnsSuccessAndTouchesNothingElse()
     {
         // Cổng gửi lặp: lượt thanh toán không còn Pending → coi như đã xử lý, không đụng tới đơn.
@@ -99,6 +117,7 @@ public sealed class HandlePaymentWebhookTests
         await _orders.DidNotReceive().TryMarkPaidAsync(Arg.Any<Guid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>());
         await _payments.DidNotReceive().MarkRefundRequiredAsync(Arg.Any<Guid>(), Arg.Any<CancellationToken>());
         _tickets.DidNotReceive().Add(Arg.Any<Ticket>()); // gửi lặp không được phát vé lần hai
+        _outbox.DidNotReceive().Add(Arg.Any<OutboxMessage>()); // ...và không xếp thêm email thứ hai
     }
 
     [Fact]
@@ -112,6 +131,7 @@ public sealed class HandlePaymentWebhookTests
         Assert.True(result.IsSuccess);
         await _payments.Received(1).MarkRefundRequiredAsync(_payment.Id, Arg.Any<CancellationToken>());
         _tickets.DidNotReceive().Add(Arg.Any<Ticket>()); // vé đã về kho: không phát vé cho đơn hết hạn
+        _outbox.DidNotReceive().Add(Arg.Any<OutboxMessage>()); // không có vé thì không gửi email vé
     }
 
     [Fact]

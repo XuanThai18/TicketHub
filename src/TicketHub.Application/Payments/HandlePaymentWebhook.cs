@@ -3,7 +3,9 @@ using MediatR;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using TicketHub.Application.Abstractions;
+using TicketHub.Application.Messaging;
 using TicketHub.Domain.Orders;
+using TicketHub.Domain.Outbox;
 using TicketHub.Domain.Payments;
 using TicketHub.Domain.Shared;
 using TicketHub.Domain.Tickets;
@@ -20,6 +22,7 @@ public sealed class HandlePaymentWebhookCommandHandler(
     IPaymentRepository paymentRepository,
     IOrderRepository orderRepository,
     ITicketRepository ticketRepository,
+    IOutboxRepository outboxRepository,
     IUnitOfWork unitOfWork,
     TimeProvider timeProvider,
     ILogger<HandlePaymentWebhookCommandHandler> logger) : IRequestHandler<HandlePaymentWebhookCommand, Result>
@@ -71,9 +74,14 @@ public sealed class HandlePaymentWebhookCommandHandler(
             // b) Đơn Pending → Paid. Đua với job hết hạn (và với huỷ đơn): ai UPDATE trước thì thắng.
             if (await orderRepository.TryMarkPaidAsync(payment.OrderId, now, ct))
             {
-                // Sinh vé ngay trong transaction này: commit thì đơn Paid và đủ vé, lỗi thì rollback cả hai.
+                // Sinh vé và xếp tin "gửi email vé" vào outbox ngay trong transaction này:
+                // commit thì có đủ đơn Paid + vé + tin, lỗi thì rollback cả ba.
                 // Chỉ chạy khi chính lời gọi này vừa đổi được đơn sang Paid, nên webhook gửi lặp không sinh vé lần hai.
-                await IssueTicketsAsync(payment.OrderId, now, ct);
+                var order = await orderRepository.GetByIdAsync(payment.OrderId, ct)
+                    ?? throw new InvalidOperationException($"Order {payment.OrderId} was just marked Paid but could not be loaded.");
+                IssueTickets(order, now);
+                outboxRepository.Add(new OrderPaidMessage(order.Id, order.UserId).ToOutbox(now));
+                await unitOfWork.SaveChangesAsync(ct);
                 return Result.Success();
             }
 
@@ -90,11 +98,8 @@ public sealed class HandlePaymentWebhookCommandHandler(
     }
 
     // Mỗi chỗ trong đơn một vé: đơn 2 VIP + 1 Thường → 3 vé, mỗi vé mã riêng.
-    private async Task IssueTicketsAsync(Guid orderId, DateTimeOffset now, CancellationToken cancellationToken)
+    private void IssueTickets(Order order, DateTimeOffset now)
     {
-        var order = await orderRepository.GetByIdAsync(orderId, cancellationToken)
-            ?? throw new InvalidOperationException($"Order {orderId} was just marked Paid but could not be loaded.");
-
         foreach (var item in order.Items)
         {
             for (var i = 0; i < item.Quantity; i++)
@@ -102,8 +107,6 @@ public sealed class HandlePaymentWebhookCommandHandler(
                 ticketRepository.Add(Ticket.Issue(order.Id, item.TicketTypeId, now));
             }
         }
-
-        await unitOfWork.SaveChangesAsync(cancellationToken);
     }
 
     private static PaymentWebhookPayload? ParsePayload(string body)

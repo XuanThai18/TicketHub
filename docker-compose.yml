@@ -1,5 +1,5 @@
 ﻿# Môi trường local. Chuẩn bị: copy .env.example thành .env rồi điền giá trị.
-# Chỉ chạy hạ tầng để debug API từ IDE: docker compose up -d postgres redis aspire-dashboard
+# Chỉ chạy hạ tầng để debug API từ IDE: docker compose up -d postgres redis rabbitmq mailpit aspire-dashboard
 services:
   postgres:
     image: postgres:16-alpine
@@ -32,6 +32,36 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Hàng đợi tin nhắn (Ticket 5). Trang quản lý: http://localhost:15672 (đăng nhập bằng RABBITMQ_USER/RABBITMQ_PASSWORD)
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: tickethub_rabbitmq
+    environment:
+      # Không dùng guest/guest: RabbitMQ chỉ cho guest đăng nhập từ localhost, container api sẽ bị từ chối.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-tickethub}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-tickethub}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Hộp thư giả cho máy dev: nhận mọi email qua SMTP cổng 1025, không gửi ra ngoài thật.
+  # Xem thư tại http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.34
+    container_name: tickethub_mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    restart: unless-stopped
+
   # Xem trace/metrics tại http://localhost:18888 (OTLP nhận ở cổng 18889 trong mạng compose)
   aspire-dashboard:
     image: mcr.microsoft.com/dotnet/aspire-dashboard:9.0
@@ -54,6 +84,8 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=${POSTGRES_DB:-tickethub};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}
       ConnectionStrings__Redis: redis:6379
+      Smtp__Host: mailpit
+      ConnectionStrings__RabbitMq: amqp://${RABBITMQ_USER:-tickethub}:${RABBITMQ_PASSWORD:-tickethub}@rabbitmq:5672
       JwtSettings__Secret: ${JWT_SECRET:?Set JWT_SECRET in .env (>= 32 chars)}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://aspire-dashboard:18889
       OTEL_SERVICE_NAME: TicketHub.Api
@@ -62,7 +94,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  rabbitmq_data:

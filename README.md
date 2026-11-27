@@ -1,8 +1,8 @@
 # TicketHub — API bán vé sự kiện chịu tải cao
 
-Backend bán vé viết bằng **.NET 10**, Clean Architecture + CQRS, PostgreSQL, Redis.
+Backend bán vé viết bằng **.NET 10**, Clean Architecture + CQRS, PostgreSQL, Redis, RabbitMQ.
 
-Bài toán cốt lõi: **mở bán 1.000 vé, 10.000 người bấm mua cùng lúc** — không bán vượt số vé, không trừ tiền hai lần khi khách bấm lại hay cổng thanh toán gọi lại, không phát vé cho đơn đã hết hạn giữ chỗ.
+Bài toán cốt lõi: **mở bán 1.000 vé, 10.000 người bấm mua cùng lúc** — không bán vượt số vé, không trừ tiền hai lần khi khách bấm lại hay cổng thanh toán gọi lại, không phát vé cho đơn đã hết hạn giữ chỗ, không mất email vé khi hệ thống gửi tin đang sập.
 
 Mỗi vấn đề dưới đây được **chứng minh bằng test trước khi sửa** (test đỏ trên code cũ, xanh sau khi sửa), chạy trên PostgreSQL thật trong container.
 
@@ -19,6 +19,8 @@ Mỗi vấn đề dưới đây được **chứng minh bằng test trước khi
 | **Tiền về sau khi đơn đã hết hạn** (job trả vé về kho chạy trước) | Webhook và job hết hạn cùng `UPDATE orders ... WHERE status = 'Pending'`, chỉ một bên thắng; webhook thua → payment `RefundRequired`, không phát vé | Cả hai thứ tự (job trước / webhook trước) đều có test |
 | **Admin tăng số vé đúng lúc đang bán** | `xmin` làm concurrency token, xung đột thì đọc lại và áp lại (tối đa 3 lần) | Tắt `xmin`: **bán 22 vé cho tổng 20**; có `xmin`: bán đúng 20 |
 | Huỷ đơn / job hết hạn trả vé hai lần | `UPDATE ... WHERE status = 'Pending'` + cộng kho bằng SQL (`available = available + n`) | Huỷ hai lần, huỷ đồng thời, quét hai lần → vé chỉ trả về một lần |
+| **Mất email vé khi RabbitMQ sập** (ghi DB và gửi tin không chung transaction) | **Transactional outbox**: tin `OrderPaid` ghi vào `outbox_messages` cùng transaction với đơn `Paid`; job nền đẩy lên RabbitMQ (publisher confirms, `FOR UPDATE SKIP LOCKED`) | Broker chết: đơn vẫn `Paid`, tin nằm chờ; sống lại → thư tới. Đã chạy cả với RabbitMQ thật (tắt container) |
+| **Gửi email vé hai lần** khi RabbitMQ giao lặp; máy chủ thư chập chờn | Consumer ack sau khi gửi, ghi `processed_messages` theo `MessageId`; lỗi tạm thời thử lại qua queue chờ có hẹn giờ, hết lượt → dead-letter | Đẩy bản lặp → vẫn 1 thư (tắt chống trùng → test đỏ); SMTP lỗi 2 lần → thử lại, đúng 1 thư; lỗi mãi → nằm ở dead-letter |
 
 Chi tiết từng quyết định, số liệu và giới hạn đã biết: [`docs/notes.md`](docs/notes.md). Kế hoạch theo ticket: [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -48,11 +50,27 @@ sequenceDiagram
     API->>DB: UPDATE payment WHERE status = 'Pending'  (chặn gọi lặp)
     API->>DB: UPDATE order SET Paid WHERE status = 'Pending'
     API->>DB: INSERT tickets (mỗi chỗ một mã)
+    API->>DB: INSERT outbox_messages (OrderPaid) — cùng transaction
     API-->>G: 200
 
     J->>DB: đơn Pending quá hạn → Expired, trả vé về kho
     Note over API,J: Webhook và job cùng nhắm đơn Pending: ai UPDATE trước thì thắng.<br/>Job thắng → payment RefundRequired, không phát vé.
 ```
+
+### Email vé
+
+```mermaid
+flowchart LR
+    OB[(outbox_messages)] -- "OutboxProcessor (2s)" --> EX{{tickethub.events}}
+    EX -- OrderPaid --> Q[ticket-emails]
+    Q --> C[TicketEmailConsumer]
+    C -- "đã có trong processed_messages" --> ACK([ack, bỏ qua])
+    C -- "soạn + gửi SMTP" --> M[Mailpit / SMTP]
+    C -- "lỗi tạm thời" --> R[ticket-emails.retry<br/>chờ 30s] -- hết hạn --> Q
+    C -- "hỏng hẳn / quá 5 lần" --> DLQ[ticket-emails.dead-letter]
+```
+
+Ít nhất một lần, không mất tin: RabbitMQ chết thì tin chờ trong outbox; app sập trước khi ack thì RabbitMQ giao lại; tin lặp bị `processed_messages` chặn. Chi tiết và giới hạn: [`docs/notes.md`](docs/notes.md), mục Ticket 5.
 
 ---
 
@@ -67,6 +85,8 @@ flowchart LR
     Api --> Infra --> App --> Domain
     Infra --> PG[(PostgreSQL)]
     Infra --> Redis[(Redis)]
+    Infra --> MQ[(RabbitMQ)]
+    Infra --> SMTP[(SMTP)]
 ```
 
 - **Chiều phụ thuộc bị khoá bằng architecture test** (NetArchTest): Domain không phụ thuộc gì; Application không được tham chiếu Infrastructure hay ASP.NET Core; chỉ query handler được đọc DB trực tiếp.
@@ -74,7 +94,7 @@ flowchart LR
 - **Đọc** qua `IReadDbContext` (không tracking, `Select` thẳng sang DTO), hoặc Dapper khi LINQ không hợp.
 - Lỗi nghiệp vụ trả về bằng `Result`/`Error` (không ném exception), đổi sang ProblemDetails ở một chỗ duy nhất.
 
-**Công nghệ:** .NET 10 · ASP.NET Core · EF Core 10 + Npgsql · Dapper · PostgreSQL 16 · Redis 7 · MediatR · FluentValidation · Serilog · OpenTelemetry (Aspire Dashboard) · Scalar · xUnit v3 · NSubstitute · Testcontainers · NetArchTest · Docker Compose · GitHub Actions / GitLab CI.
+**Công nghệ:** .NET 10 · ASP.NET Core · EF Core 10 + Npgsql · Dapper · PostgreSQL 16 · Redis 7 · RabbitMQ 4 (RabbitMQ.Client) · MailKit + Mailpit · MediatR · FluentValidation · Serilog · OpenTelemetry (Aspire Dashboard) · Scalar · xUnit v3 · NSubstitute · Testcontainers · NetArchTest · Docker Compose · GitHub Actions / GitLab CI.
 
 ---
 
@@ -93,7 +113,10 @@ flowchart LR
 | Vé | `GET /api/v1/tickets/my` | đăng nhập |
 | Tài khoản | `/api/v1/auth/login`, `/refresh`, `/logout`, `/me`, `/sessions`, `/change-password`, `/users` | xem mục [Đăng nhập](#đăng-nhập) |
 
-Chạy nền: **`OrderExpiryService`** mỗi 30 giây chuyển đơn quá hạn giữ chỗ sang `Expired` và trả vé về kho (mỗi đơn một transaction, lỗi một đơn không chặn đơn khác).
+Chạy nền:
+- **`OrderExpiryService`** mỗi 30 giây chuyển đơn quá hạn giữ chỗ sang `Expired` và trả vé về kho (mỗi đơn một transaction, lỗi một đơn không chặn đơn khác).
+- **`OutboxProcessor`** mỗi 2 giây đẩy tin chưa gửi trong `outbox_messages` lên RabbitMQ.
+- **`TicketEmailConsumer`** nghe queue `ticket-emails`, gửi email mã vé cho người mua.
 
 ---
 
@@ -103,7 +126,7 @@ Yêu cầu: Docker Desktop.
 
 ```bash
 cp .env.example .env          # điền POSTGRES_USER/PASSWORD, JWT_SECRET (>= 32 ký tự)
-docker compose up -d --build  # Postgres, Redis, Aspire Dashboard, API (tự chạy migration)
+docker compose up -d --build  # Postgres, Redis, RabbitMQ, Mailpit, Aspire Dashboard, API (tự chạy migration)
 ```
 
 Mở **http://localhost:8080/scalar** để xem tài liệu và gọi thử API.
@@ -128,6 +151,22 @@ Dán `accessToken` vào mục Authentication (Bearer) của Scalar.
 3. *(User)* `POST /orders/{id}/pay` → nhận `checkoutUrl`.
 4. Gọi **POST** tới `checkoutUrl` (cổng thanh toán giả lập, chỉ có ở Development; thêm `?outcome=failed` để giả lập thất bại).
 5. *(User)* `GET /orders/{id}` → đơn `Paid` kèm 2 vé; `GET /tickets/my`.
+6. Mở **http://localhost:8025** (Mailpit) xem email vé.
+
+> Email chỉ gửi được khi người mua là **tài khoản thật** (consumer tra email trong bảng người dùng). Token `/dev/token` ở trên mang Id tự đặt nên thư sẽ vào dead-letter. Muốn thấy thư thì mua bằng tài khoản có sẵn: `POST /api/v1/auth/login` với `admin@example.com` / `ChangeMe123!`, hoặc tạo tài khoản bằng `POST /api/v1/auth/users`.
+
+**3. Thử email vé khi RabbitMQ sập** (đăng nhập `admin@example.com` như trên, đã có sự kiện đang bán):
+
+```bash
+docker compose stop rabbitmq     # 1. RabbitMQ "chết"
+# 2. Đặt vé, POST /orders/{id}/pay, POST checkoutUrl → đơn vẫn Paid, Mailpit chưa có thư
+docker exec tickethub_postgres psql -U postgres -d tickethub \
+  -c "SELECT processed_at, attempts, last_error FROM outbox_messages ORDER BY occurred_at DESC LIMIT 1"
+                                 # 3. tin nằm chờ: processed_at trống, attempts tăng dần
+docker compose start rabbitmq    # 4. vài giây sau thư tới Mailpit, processed_at có giá trị
+```
+
+Xem queue (gồm `ticket-emails.retry`, `ticket-emails.dead-letter`) ở RabbitMQ Management: **http://localhost:15672** (`tickethub` / `tickethub`).
 
 Xem SQL mà EF sinh ra cho từng request: `docker logs -f tickethub_api`.
 
@@ -137,6 +176,8 @@ Xem SQL mà EF sinh ra cho từng request: `docker logs -f tickethub_api`.
 | `http://localhost:8080/openapi/v1.json` | Tài liệu OpenAPI |
 | `http://localhost:8080/health/live`, `/health/ready` | Probe cho k8s |
 | `http://localhost:18888` | Aspire Dashboard: trace, metrics |
+| `http://localhost:8025` | Mailpit: hộp thư giả, xem email vé |
+| `http://localhost:15672` | RabbitMQ Management: queue, tin trong dead-letter |
 
 ---
 
@@ -146,7 +187,7 @@ Yêu cầu: .NET SDK 10, Docker Desktop.
 
 ```bash
 cp .env.example .env
-docker compose up -d postgres redis aspire-dashboard   # chỉ hạ tầng (Postgres ở cổng host 5433)
+docker compose up -d postgres redis rabbitmq mailpit aspire-dashboard   # chỉ hạ tầng (Postgres ở cổng host 5433)
 dotnet tool restore                                    # dotnet-ef
 dotnet run --project src/TicketHub.Api                 # http://localhost:5315/scalar, tự migrate, in SQL ra console
 ```
@@ -159,12 +200,13 @@ dotnet run --project src/TicketHub.Api                 # http://localhost:5315/s
 src/
   TicketHub.Domain          Events, TicketTypes, Orders, Payments, Tickets, Auth; Result/Error
   TicketHub.Application     Command/Query + Handler + Validator theo từng nghiệp vụ
-  TicketHub.Infrastructure  EF Core, Dapper, repository, interceptor, migration, OrderExpiryService
+  TicketHub.Infrastructure  EF Core, Dapper, repository, interceptor, migration, job nền,
+                            Messaging (outbox → RabbitMQ, consumer email), Email (SMTP)
   TicketHub.Api             Controller, auth, rate limit, OpenAPI, health, cổng thanh toán giả lập
 tests/
   TicketHub.UnitTests          Domain + handler + validator (NSubstitute)
   TicketHub.ArchitectureTests  Khoá chiều phụ thuộc giữa các tầng
-  TicketHub.IntegrationTests   API thật + Postgres/Redis trong container (Testcontainers)
+  TicketHub.IntegrationTests   API thật + Postgres/Redis/RabbitMQ/Mailpit trong container (Testcontainers)
 docs/
   DESIGN.md   Thiết kế và kế hoạch theo ticket
   notes.md    Quyết định kỹ thuật: làm gì, vì sao, giới hạn đã biết
@@ -270,6 +312,11 @@ Giá trị bí mật **không** nằm trong `appsettings.json`; đặt qua biế
 |---|---|---|
 | `ConnectionStrings__DefaultConnection` | ✔ | PostgreSQL |
 | `ConnectionStrings__Redis` | ✔ | |
+| `ConnectionStrings__RabbitMq` | ✔ | `amqp://user:pass@host:5672` |
+| `Smtp__Host`, `Smtp__Port` | ✔ | Máy chủ gửi email; dev là Mailpit (1025) |
+| `Smtp__UseSsl`, `Smtp__UserName`, `Smtp__Password` | | Máy chủ thư thật (SendGrid, SES...); để trống tên = không đăng nhập |
+| `Smtp__FromAddress`, `Smtp__FromName` | | Mặc định `no-reply@tickethub.local`, `TicketHub` |
+| `TicketEmailConsumer__MaxRetries`, `__RetryDelay` | | Thử lại email khi lỗi tạm thời, mặc định 5 lần × `00:00:30` |
 | `JwtSettings__Secret` | ✔ | ≥ 32 ký tự; thiếu/ngắn → app dừng ngay khi khởi động |
 | `Payments__WebhookSecret` | ✔ | Khoá ký webhook chung với cổng thanh toán, ≥ 32 ký tự |
 | `Payments__SignatureToleranceSeconds` | | Độ lệch timestamp tối đa của webhook, mặc định 300 |
@@ -292,4 +339,5 @@ Giá trị bí mật **không** nằm trong `appsettings.json`; đặt qua biế
 
 - Hoàn tiền thật cho payment `RefundRequired` (hiện mới đánh dấu).
 - Soát vé (`Valid → Used`), huỷ vé khi huỷ sự kiện.
-- Gửi email vé qua RabbitMQ + Outbox, cache Redis cho trang sự kiện, đo tải bằng k6, deploy (Ticket 5–8 trong [`docs/DESIGN.md`](docs/DESIGN.md)).
+- Dọn bảng `outbox_messages` / `processed_messages`; công cụ xem và gửi lại tin trong dead-letter (hiện làm tay qua RabbitMQ Management).
+- Cache Redis cho trang sự kiện, đo tải bằng k6, deploy (Ticket 6–8 trong [`docs/DESIGN.md`](docs/DESIGN.md)).
