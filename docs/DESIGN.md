@@ -281,6 +281,12 @@ erDiagram
 - Cache `GET /events`, `GET /events/{id}` bằng Redis (`IDistributedCache`), TTL 60 giây; sửa sự kiện → **xoá cache** tương ứng.
 - **Không cache** `available_quantity` (hoặc cache rất ngắn) — ghi lý do vào notes.
 
+- [x] 6.1 `ICacheService` trên `IDistributedCache` (Redis): lỗi Redis coi như cache miss, `null` không lưu
+- [x] 6.2 Chi tiết sự kiện công khai cache 60 giây; số vé còn đọc lại từ DB mỗi lần; bản nháp không bao giờ vào cache
+- [x] 6.3 Danh sách cache theo khoá phiên bản và tham số đã băm; đổi phiên bản làm mọi trang cũ hết hiệu lực
+- [x] 6.4 `Publish`, `Cancel` xoá phiên bản danh sách và chi tiết; sửa loại vé xoá chi tiết; xoá sau khi commit
+- [x] 6.5 Ghi chú trong `notes.md`, cách thử trong README
+
 ### Ticket 7 — Đo tải k6
 
 - Kịch bản: 5.000 người dùng ảo cùng mua 1.000 vé.
@@ -339,6 +345,6 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Ticket 3 — Chống bán vượt (nhánh `ticket-3-oversell`, chờ merge)
 - [x] Ticket 4 — Thanh toán + idempotency (nhánh `ticket-4-payment`, chờ merge) → **cập nhật CV, bắt đầu nộp**
 - [x] Ticket 5 — RabbitMQ + Outbox (nhánh `ticket-5-outbox`, chờ merge)
-- [ ] Ticket 6 — Cache
+- [x] Ticket 6 — Cache (nhánh `ticket-6-cache`, chờ merge)
 - [ ] Ticket 7 — Đo tải k6
 - [ ] Ticket 8 — Deploy

@@ -21,6 +21,7 @@ Mỗi vấn đề dưới đây được **chứng minh bằng test trước khi
 | Huỷ đơn / job hết hạn trả vé hai lần | `UPDATE ... WHERE status = 'Pending'` + cộng kho bằng SQL (`available = available + n`) | Huỷ hai lần, huỷ đồng thời, quét hai lần → vé chỉ trả về một lần |
 | **Mất email vé khi RabbitMQ sập** (ghi DB và gửi tin không chung transaction) | **Transactional outbox**: tin `OrderPaid` ghi vào `outbox_messages` cùng transaction với đơn `Paid`; job nền đẩy lên RabbitMQ (publisher confirms, `FOR UPDATE SKIP LOCKED`) | Broker chết: đơn vẫn `Paid`, tin nằm chờ; sống lại → thư tới. Đã chạy cả với RabbitMQ thật (tắt container) |
 | **Gửi email vé hai lần** khi RabbitMQ giao lặp; máy chủ thư chập chờn | Consumer ack sau khi gửi, ghi `processed_messages` theo `MessageId`; lỗi tạm thời thử lại qua queue chờ có hẹn giờ, hết lượt → dead-letter | Đẩy bản lặp → vẫn 1 thư (tắt chống trùng → test đỏ); SMTP lỗi 2 lần → thử lại, đúng 1 thư; lỗi mãi → nằm ở dead-letter |
+| **Đọc sự kiện chạm DB mỗi lần** và **ghi xong vẫn thấy bản cũ** | Cache Redis 60 giây cho chi tiết và danh sách; danh sách gắn khoá phiên bản nên đổi phiên bản là mọi trang cũ hết hiệu lực; ghi xong xoá đúng khoá. Số vé còn **không cache** (tránh hiển thị sai số vé) | Sửa tên bằng SQL → vẫn ra tên cũ (đang cache); sửa qua API → thấy ngay; số vé còn luôn mới |
 
 Chi tiết từng quyết định, số liệu và giới hạn đã biết: [`docs/notes.md`](docs/notes.md). Kế hoạch theo ticket: [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -169,6 +170,15 @@ docker compose start rabbitmq    # 4. vài giây sau thư tới Mailpit, process
 Xem queue (gồm `ticket-emails.retry`, `ticket-emails.dead-letter`) ở RabbitMQ Management: **http://localhost:15672** (`tickethub` / `tickethub`).
 
 Xem SQL mà EF sinh ra cho từng request: `docker logs -f tickethub_api`.
+
+**4. Thử cache** (có sự kiện đang bán, đã gọi `GET /api/v1/events/{id}` một lần):
+
+```bash
+docker exec tickethub_redis redis-cli --scan --pattern "TicketHub_*"       # khoá cache hiện có
+docker exec tickethub_redis redis-cli TTL "TicketHub_event:{id}:public"       # còn bao nhiêu giây (60 → 0)
+```
+
+Sửa tên sự kiện bằng SQL trong `tickethub_postgres` rồi gọi lại: vẫn ra tên cũ cho tới khi hết TTL. Sửa qua API (`PUT`) thì tên mới hiện ngay, vì khoá đã bị xoá.
 
 | Địa chỉ | Nội dung |
 |---|---|
@@ -340,4 +350,4 @@ Giá trị bí mật **không** nằm trong `appsettings.json`; đặt qua biế
 - Hoàn tiền thật cho payment `RefundRequired` (hiện mới đánh dấu).
 - Soát vé (`Valid → Used`), huỷ vé khi huỷ sự kiện.
 - Dọn bảng `outbox_messages` / `processed_messages`; công cụ xem và gửi lại tin trong dead-letter (hiện làm tay qua RabbitMQ Management).
-- Cache Redis cho trang sự kiện, đo tải bằng k6, deploy (Ticket 6–8 trong [`docs/DESIGN.md`](docs/DESIGN.md)).
+- Đo tải bằng k6, deploy (Ticket 7–8 trong [`docs/DESIGN.md`](docs/DESIGN.md)).
