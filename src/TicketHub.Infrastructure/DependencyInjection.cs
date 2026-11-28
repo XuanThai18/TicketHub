@@ -82,7 +82,7 @@ public static class DependencyInjection
 
         services.AddStackExchangeRedisCache(options =>
         {
-            options.Configuration = redisConnectionString;
+            options.ConfigurationOptions = RedisConnectionOptions.Create(redisConnectionString);
             options.InstanceName = "TicketHub_";
         });
         services.AddSingleton<ICacheService, DistributedCacheService>();
