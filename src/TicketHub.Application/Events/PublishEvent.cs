@@ -17,7 +17,8 @@ public sealed class PublishEventCommandValidator : AbstractValidator<PublishEven
     }
 }
 
-public sealed class PublishEventCommandHandler(IEventRepository eventRepository, ITicketTypeRepository ticketTypeRepository, IUnitOfWork unitOfWork) : IRequestHandler<PublishEventCommand, Result>
+public sealed class PublishEventCommandHandler(IEventRepository eventRepository, ITicketTypeRepository ticketTypeRepository, IUnitOfWork unitOfWork,
+    ICacheService cache) : IRequestHandler<PublishEventCommand, Result>
 { 
     public async Task<Result> Handle(PublishEventCommand request, CancellationToken cancellationToken)
     {
@@ -36,6 +37,8 @@ public sealed class PublishEventCommandHandler(IEventRepository eventRepository,
         }
 
         await unitOfWork.SaveChangesAsync(cancellationToken);
+        // Sau khi lưu: sự kiện lên công khai, đổi danh sách (Trước danh sách sự kiện công khai có thể không có sự kiện này, nhưng bây giờ thì thêm công khai nó => xoá cache để đọc lại từ DB)
+        await cache.RemoveAsync(ListEventsQueryHandler.VersionKey, cancellationToken);
         return Result.Success();
     }
 }

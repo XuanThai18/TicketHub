@@ -16,6 +16,7 @@ public sealed class UpdateTicketTypeTests
     private readonly IEventRepository _events = Substitute.For<IEventRepository>();
     private readonly ITicketTypeRepository _ticketTypes = Substitute.For<ITicketTypeRepository>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
+    private readonly ICacheService _cache = Substitute.For<ICacheService>();
 
     public UpdateTicketTypeTests()
     {
@@ -25,7 +26,7 @@ public sealed class UpdateTicketTypeTests
             .Returns(ci => ci.ArgAt<Func<CancellationToken, Task<Result>>>(0)(CancellationToken.None));
     }
 
-    private UpdateTicketTypeCommandHandler Handler() => new(_events, _ticketTypes, _unitOfWork);
+    private UpdateTicketTypeCommandHandler Handler() => new(_events, _ticketTypes, _unitOfWork, _cache);
 
     // Sự kiện đang bán (Published) có một loại vé VIP 10 vé.
     private (Event Event, TicketType Ticket) GivenOnSale()

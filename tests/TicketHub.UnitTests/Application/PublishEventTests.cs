@@ -14,8 +14,9 @@ public sealed class PublishEventTests
     private readonly IEventRepository _events = Substitute.For<IEventRepository>();
     private readonly ITicketTypeRepository _ticketTypes = Substitute.For<ITicketTypeRepository>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
+    private readonly ICacheService _cache = Substitute.For<ICacheService>();
 
-    private PublishEventCommandHandler Handler() => new(_events, _ticketTypes, _unitOfWork);
+    private PublishEventCommandHandler Handler() => new(_events, _ticketTypes, _unitOfWork, _cache);
 
     // Dặn cả hai bản giả cùng lúc: DB có sự kiện này, và sự kiện có <ticketTypeCount> loại vé.
     private Event GivenDraftEvent(int ticketTypeCount)

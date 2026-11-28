@@ -2,6 +2,7 @@ using FluentValidation;
 using MediatR;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Common.Exceptions;
+using TicketHub.Application.Events;
 using TicketHub.Domain.Events;
 using TicketHub.Domain.Shared;
 using TicketHub.Domain.TicketTypes;
@@ -32,7 +33,8 @@ public sealed class UpdateTicketTypeCommandValidator : AbstractValidator<UpdateT
 public sealed class UpdateTicketTypeCommandHandler(
     IEventRepository eventRepository,
     ITicketTypeRepository ticketTypeRepository,
-    IUnitOfWork unitOfWork) : IRequestHandler<UpdateTicketTypeCommand, Result>
+    IUnitOfWork unitOfWork,
+    ICacheService cache) : IRequestHandler<UpdateTicketTypeCommand, Result>
 {
     // Bên admin ít tranh chấp: vài lần là đủ, hết lượt thì trả 409 để admin thử lại.
     private const int MaxAttempts = 3;
@@ -60,9 +62,16 @@ public sealed class UpdateTicketTypeCommandHandler(
         {
             try
             {
-                return await unitOfWork.ExecuteInTransactionAsync(
+                var result = await unitOfWork.ExecuteInTransactionAsync(
                     ct => UpdateOnceAsync(request, name, ct),
                     cancellationToken: cancellationToken);
+                if (result.IsSuccess)
+                {
+                    // Sau khi lưu: chi tiết cũ (giá, số vé) phải bỏ.
+                    await cache.RemoveAsync(GetEventByIdQueryHandler.PublicCacheKey(request.EventId), cancellationToken);
+                }
+
+                return result;
             }
             catch (ConcurrencyConflictException) when (attempt < MaxAttempts)
             {
