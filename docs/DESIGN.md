@@ -296,6 +296,11 @@ erDiagram
 
 - VPS giá rẻ, Docker Compose, Caddy (tự lo HTTPS); job `migrate` trong CI.
 - README có sơ đồ kiến trúc, link demo, kết quả k6.
+### Ticket 7b — Tối ưu đường đặt vé
+
+- Bối cảnh: Ticket 7 đo được p95 đặt đơn khoảng 6,1 s và 1.298/5.000 lượt bị bỏ; nghẽn do pool kết nối (300) đầy và khoá dòng `ticket_types` khi mọi đơn cùng loại vé xếp hàng (`notes.md` mục 11).
+- Hướng: rút ngắn thời gian giữ khoá của mỗi đơn (ít việc hơn trong transaction, trừ số lượng bằng một `UPDATE` có điều kiện). Chỉ cân nhắc bộ đếm Redis hoặc hàng đợi nếu cách này không đủ.
+- **Chứng minh:** chạy lại `loadtest/k6/ticket-oversell.js` đạt 5.000 lượt không bị bỏ, vẫn đúng 1.000 vé bán ra, 0 vé vượt, p95 giảm rõ so với 6,1 s.
 
 ---
 
@@ -348,3 +353,4 @@ gõ tay, không copy-paste; làm xong phải tự giải thích lại được b
 - [x] Ticket 6 — Cache (nhánh `ticket-6-cache`, chờ merge)
 - [ ] Ticket 7 — Đo tải k6
 - [ ] Ticket 8 — Deploy
+- [ ] Ticket 7b — Tối ưu đường đặt vé
