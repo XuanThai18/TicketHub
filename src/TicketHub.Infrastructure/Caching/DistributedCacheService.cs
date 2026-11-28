@@ -14,6 +14,7 @@ internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<D
     public async Task<T?> GetOrCreateAsync<T>(string key, Func<CancellationToken, Task<T?>> factory, TimeSpan expiration,
         CancellationToken cancellationToken)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
         ArgumentNullException.ThrowIfNull(factory);
 
         var cached = await TryGetAsync(key, cancellationToken);
