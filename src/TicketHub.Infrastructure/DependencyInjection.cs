@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using RabbitMQ.Client;
+using StackExchange.Redis;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Payments;
 using TicketHub.Infrastructure.Auth;
@@ -82,14 +83,14 @@ public static class DependencyInjection
 
         services.AddStackExchangeRedisCache(options =>
         {
-            options.Configuration = redisConnectionString;
+            options.ConfigurationOptions = RedisConnectionOptions.Create(redisConnectionString);
             options.InstanceName = "TicketHub_";
         });
         services.AddSingleton<ICacheService, DistributedCacheService>();
 
         services.AddHealthChecks()
             .AddNpgSql(name: "postgres", tags: [ReadyTag], timeout: TimeSpan.FromSeconds(3))
-            .AddRedis(redisConnectionString, name: "redis", tags: [ReadyTag], timeout: TimeSpan.FromSeconds(3));
+            .AddRedis(_ => ConnectionMultiplexer.Connect(RedisConnectionOptions.Create(redisConnectionString)), name: "redis", tags: [ReadyTag], timeout: TimeSpan.FromSeconds(3));
 
         return services;
     }

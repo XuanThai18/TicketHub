@@ -574,7 +574,7 @@ tickethub.events (direct) ──"OrderPaid"──▶ ticket-emails ──(hỏng
 ### 6. Giới hạn đã biết
 
 - **Chi tiết có thể lệch tới 60 giây khi ghi và đọc chạy đua.** Một request đọc đã lấy bản cũ từ DB trước commit, rồi lưu vào cache sau khi ta đã xoá. Chấp nhận vì TTL ngắn. Muốn triệt để thì áp dụng khoá có phiên bản như danh sách.
-- **Redis chết thì mỗi request đều chạm DB.** Đúng về dữ liệu, chỉ mất lợi ích cache. Nhưng mỗi lần ghi phải chờ `RemoveAsync` thất bại, thời gian chờ phụ thuộc timeout kết nối của StackExchange.Redis. **Chưa đo.** Xem mục 8.
+- **Redis chết thì mỗi request chờ timeout, không chỉ mất cache.** Đã đo (mục 9): ghi chậm từ ~25 ms lên ~5,9 giây, đọc chi tiết từ ~10 ms lên ~11 giây. Sau khi giảm timeout (mục 10): ~0,9 giây và ~2 giây. Nguyên nhân: StackExchange.Redis chờ `SyncTimeout` (mặc định 5 giây) cho mỗi lệnh; đọc miss rồi ghi lại là hai lệnh, nên ~10–12 giây. Khi Redis sống lại, mọi thứ trở về bình thường ngay.
 - **Redis chết thì danh sách không bao giờ hit.** Factory tạo GUID mới mỗi request, nên khoá trang không bao giờ được tra lại. Vẫn đúng, chỉ không có lợi ích.
 - **`GetValueOrDefault` trả 0 khi thiếu loại vé** trong truy vấn số vé. Hiện chỉ xảy ra khi loại vé bị xoá giữa hai truy vấn, mà chưa có chức năng xoá loại vé. Nếu xảy ra, người dùng sẽ thấy "hết vé" sai. Có thể bỏ loại vé đó khỏi kết quả, hoặc đổi thành nullable.
 - Chưa có metric tỷ lệ hit/miss, nên chưa biết cache có thật sự giảm tải không. Xem Ticket 7.
@@ -591,7 +591,35 @@ tickethub.events (direct) ──"OrderPaid"──▶ ticket-emails ──(hỏng
 
 Test "đọc cũ sau khi sửa DB" chứng minh có cache. Riêng test invalidate (`EventWriteInvalidationTests`) đã được chạy đỏ trước khi thêm xoá cache, rồi xanh sau khi thêm.
 
-### 8. Chưa đo
+### 8. Chưa đo: tải
 
-- **Độ trễ ghi khi Redis chết** (mục 6). Cần dừng container `tickethub_redis`, gọi một lệnh ghi, đo thời gian phản hồi.
 - **Hiệu quả cache dưới tải** và chống stampede: Ticket 7 (k6).
+
+### 9. Đo độ trễ khi Redis chết
+
+Đo thủ công trên máy dev: API chạy `dotnet run` (Development), hạ tầng trong Docker Desktop, `docker compose stop redis` rồi `start redis`. Mỗi dòng là 5 lần ghi (PUT loại vé) hoặc 3 lần đọc (chi tiết công khai).
+
+| Trạng thái Redis | Ghi (PUT loại vé) | Đọc (chi tiết) |
+|---|---|---|
+| Sống | 16–98 ms | 5–29 ms |
+| Chết | 5,6–6,0 giây | 10,9–12,0 giây |
+| Sống lại | 14–35 ms | 4–9 ms |
+
+- Redis chết, mỗi lệnh chờ hết `SyncTimeout` (mặc định 5 giây). Ghi chỉ có một lệnh `RemoveAsync` nên khoảng 6 giây. Đọc miss có hai lệnh (`GetAsync` rồi `SetAsync`), nên khoảng 11 giây.
+- Đây không phải "chỉ mất cache" như mục 6 ban đầu nghĩ. Cần giảm timeout hoặc tắt tạm Redis khi đã lỗi.
+- Đây là một lần đo nhỏ, không phải tải. Ticket 7 (k6) sẽ đo lại dưới tải.
+
+### 10. Đo lại timeout 300 ms, sau đó hạ xuống 100 ms
+
+`RedisConnectionOptions`: `ConnectTimeout` và `SyncTimeout` ban đầu 300 ms (bảng dưới đo ở mức này), hiện là 100 ms (chưa đo lại lúc Redis chết), `AbortOnConnectFail = false` (app vẫn khởi động khi Redis chưa lên, cache coi như miss). Đo lại cùng cách với mục 9:
+
+| Trạng thái Redis | Ghi (PUT loại vé) | Đọc (chi tiết) |
+|---|---|---|
+| Sống | 14–70 ms | ~20 ms |
+| Chết, trước khi giảm timeout | 5,6–6,0 giây | 10,9–12,0 giây |
+| Chết, sau khi giảm timeout | 0,83–0,95 giây | 1,93–1,98 giây |
+| Sống lại | — | 20 ms |
+
+- Giảm được khoảng 6 lần ở ghi và 5–6 lần ở đọc. Chưa đạt ước lượng 0,3 và 0,6 giây: mỗi lệnh Redis chết tốn thêm thời gian ngoài `SyncTimeout`, nên đọc có ba lệnh thay vì hai.
+- Bộ ngắt mạch: sau một lỗi Redis, 30 giây kế tiếp mọi thao tác bỏ qua Redis, nên chỉ lỗi đầu tiên trong mỗi cửa sổ còn chậm.
+- Test: `RedisConnectionOptionsTests` (3 test: timeout ≤ 500 ms, không abort khi khởi động, giữ đúng host và port). Toàn bộ solution 253/253 xanh.
