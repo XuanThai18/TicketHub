@@ -5,7 +5,7 @@ namespace TicketHub.Infrastructure.Caching;
 /// <summary>Cấu hình kết nối Redis cho cache: timeout ngắn để Redis chết không làm request chờ 5 giây.</summary>
 internal static class RedisConnectionOptions
 {
-    internal const int TimeoutMs = 300;
+    internal const int TimeoutMs = 100;
 
     internal static ConfigurationOptions Create(string connectionString)
     {
