@@ -623,3 +623,17 @@ Test "đọc cũ sau khi sửa DB" chứng minh có cache. Riêng test invalidat
 - Giảm được khoảng 6 lần ở ghi và 5–6 lần ở đọc. Chưa đạt ước lượng 0,3 và 0,6 giây: mỗi lệnh Redis chết tốn thêm thời gian ngoài `SyncTimeout`, nên đọc có ba lệnh thay vì hai.
 - Bộ ngắt mạch: sau một lỗi Redis, 30 giây kế tiếp mọi thao tác bỏ qua Redis, nên chỉ lỗi đầu tiên trong mỗi cửa sổ còn chậm.
 - Test: `RedisConnectionOptionsTests` (3 test: timeout ≤ 500 ms, không abort khi khởi động, giữ đúng host và port). Toàn bộ solution 253/253 xanh.
+
+### 11. Ticket 7 — k6: 5.000 người mua 1.000 vé (chưa đạt)
+
+- Kịch bản `loadtest/k6/ticket-oversell.js`: 5.000 lượt mua, mỗi lượt 1 vé, 1.000 vé. Các lượt đến trong 10 giây (500/s), không tức thời.
+- Kết quả lần chạy cuối: 1.000 đơn 201, 2.703 đơn 409, 0 lỗi khác. Không bán vượt.
+- Chưa đạt: k6 chỉ hoàn thành 3.703/5.000 lượt (1.298 bị bỏ). p95 đặt đơn ≈ 6,1 s, trung bình ≈ 2,4 s.
+- Nghẽn: pool Npgsql 300 đầy (301 kết nối tới DB `tickethub`). Các đơn cùng loại vé khoá cùng dòng `ticket_types` nên xếp hàng.
+- Thay đổi môi trường để chạy được: `max_connections` PostgreSQL 100 → 400 (`ALTER SYSTEM`, container dev đã restart); tăng rate limit và `Maximum Pool Size` qua biến môi trường, chỉ trong lúc test.
+- Các lần thất bại trước:
+  - Rate limit toàn cục 100 request/cửa sổ theo IP trả 429.
+  - 5.000 kết nối đồng thời bị từ chối ở tầng mạng.
+  - `setup()` giữ 5.000 token làm k6 tốn bộ nhớ và không cấp đủ VU.
+
+- Đã chấp nhận kết quả trên để chuyển sang Ticket 8. Các điểm chưa đạt (5.000 lượt đồng thời, p95) được ghi nhận, chưa sửa.
