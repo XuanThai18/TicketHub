@@ -12,8 +12,9 @@ public sealed class CancelEventTests
 
     private readonly IEventRepository _events = Substitute.For<IEventRepository>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
+    private readonly ICacheService _cache = Substitute.For<ICacheService>();
 
-    private CancelEventCommandHandler Handler() => new(_events, _unitOfWork);
+    private CancelEventCommandHandler Handler() => new(_events, _unitOfWork, _cache);
 
     // Dặn bản giả: DB có sự kiện này (trạng thái Draft).
     private Event GivenEvent()

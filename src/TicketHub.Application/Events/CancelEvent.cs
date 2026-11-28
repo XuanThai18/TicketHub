@@ -16,7 +16,8 @@ public sealed class CancelEventCommandValidator : AbstractValidator<CancelEventC
     }
 }
 
-public sealed class CancelEventCommandHandler(IEventRepository eventRepository, IUnitOfWork unitOfWork) : IRequestHandler<CancelEventCommand, Result>
+public sealed class CancelEventCommandHandler(IEventRepository eventRepository, IUnitOfWork unitOfWork,
+    ICacheService cache) : IRequestHandler<CancelEventCommand, Result>
 {
     public async Task<Result> Handle(CancelEventCommand request, CancellationToken cancellationToken)
     {
@@ -31,6 +32,9 @@ public sealed class CancelEventCommandHandler(IEventRepository eventRepository, 
             return result.Error;
         }
         await unitOfWork.SaveChangesAsync(cancellationToken);
+        // Sau khi lưu: sự kiện hết hiệu lực, đổi cả danh sách lẫn chi tiết.
+        await cache.RemoveAsync(GetEventByIdQueryHandler.PublicCacheKey(request.Id), cancellationToken);
+        await cache.RemoveAsync(ListEventsQueryHandler.VersionKey, cancellationToken);
         return Result.Success();
     }
 }

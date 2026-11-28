@@ -6,6 +6,7 @@ using RabbitMQ.Client;
 using TicketHub.Application.Abstractions;
 using TicketHub.Application.Payments;
 using TicketHub.Infrastructure.Auth;
+using TicketHub.Infrastructure.Caching;
 using TicketHub.Infrastructure.Email;
 using TicketHub.Infrastructure.Messaging;
 using TicketHub.Infrastructure.Orders;
@@ -84,6 +85,7 @@ public static class DependencyInjection
             options.Configuration = redisConnectionString;
             options.InstanceName = "TicketHub_";
         });
+        services.AddSingleton<ICacheService, DistributedCacheService>();
 
         services.AddHealthChecks()
             .AddNpgSql(name: "postgres", tags: [ReadyTag], timeout: TimeSpan.FromSeconds(3))

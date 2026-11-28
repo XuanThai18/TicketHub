@@ -529,3 +529,69 @@ tickethub.events (direct) ──"OrderPaid"──▶ ticket-emails ──(hỏng
 - Dead-letter chưa có công cụ xem/gửi lại; hiện phải làm tay qua RabbitMQ Management UI.
 - Độ trễ email: tới 2 giây chờ lượt quét outbox, cộng thời gian gửi SMTP.
 - Mẫu thư đơn giản (chữ + HTML), chưa có mã QR.
+
+---
+
+## Ticket 6: Cache Redis
+
+### 1. Cache cái gì, không cache cái gì
+
+| Dữ liệu | Cache? | Vì sao |
+|---|---|---|
+| Chi tiết sự kiện công khai (tên, giờ, loại vé, giá, giới hạn mua) | Có, 60 giây | Đọc nhiều, ít đổi; lệch vài chục giây không gây hại |
+| Danh sách sự kiện công khai, theo từng bộ tham số | Có, 60 giây, theo phiên bản | Như trên |
+| Số vé còn (`AvailableQuantity`) | **Không** | Đổi theo từng đơn. Cache sẽ hiện "còn vé" khi đã hết, hoặc ngược lại. Đây là chỗ bán vượt đã sửa ở Ticket 3, không đưa lại vào cache. Phần này vẫn là một `SELECT` nhẹ theo `EventId` mỗi lần đọc |
+| Bản nháp | Không | Chỉ Admin và Manager được xem. Nếu đưa vào cache công khai thì người ẩn danh thấy được |
+| Đơn hàng, vé, thanh toán | Không | Dữ liệu riêng của từng người, đổi theo thao tác. Không đáng cache |
+
+### 2. Cache-aside qua `ICacheService`
+
+- `GetOrCreateAsync(key, factory, ttl)`: đọc Redis trước. Có thì trả về. Không có thì chạy `factory` (truy vấn DB), lưu lại rồi trả về.
+- **Giá trị `null` không được lưu.** Sự kiện không tồn tại hoặc là bản nháp đều trả 404 và không vào cache. Nếu lưu `null`, sự kiện vừa được publish sẽ bị 404 cho tới khi hết TTL.
+- **Lỗi Redis chỉ ghi log, coi như cache miss.** Lỗi khi đọc thì gọi DB, lỗi khi ghi thì bỏ qua. `OperationCanceledException` được ném tiếp, không bị nuốt.
+- Lưu dạng JSON (`JsonSerializerOptions.Web`). Khoá có tiền tố `TicketHub_` (`InstanceName`) để nhiều ứng dụng dùng chung một Redis không đụng khoá của nhau.
+
+### 3. Vì sao không dùng HybridCache
+
+- HybridCache (.NET 9 trở lên) có lớp L1 trong bộ nhớ và chống "cache stampede". Chưa dùng vì app chạy nhiều pod. L1 nằm trong từng pod, nên xoá khoá trong Redis không xoá L1 của pod khác. Pod đó sẽ giữ bản cũ tới hết TTL. Muốn đúng thì phải thêm backplane, phức tạp hơn lợi ích khi TTL chỉ 60 giây.
+- Chống stampede chưa làm: khi khoá hết hạn, nhiều request cùng miss rồi cùng truy vấn DB. Mức này chấp nhận được với tải hiện tại. Sẽ kiểm lại ở Ticket 7.
+
+### 4. Khoá chi tiết: xoá khi nào
+
+- Khoá: `event:{id}:public`.
+- **Xoá** khi `PublishEvent`, `CancelEvent` (đổi trạng thái hiển thị) và `UpdateTicketType` (đổi giá, giới hạn mua, tên, mô tả).
+- **Không xoá** khi `UpdateEvent` và `AddTicketType`: cả hai chỉ chạy được khi còn là bản nháp, mà bản nháp không bao giờ nằm trong cache công khai.
+- Xoá **sau khi ghi thành công**, không trước. Nếu xoá trước, một request đọc chen vào có thể lấy dữ liệu cũ từ DB, lưu lại vào cache, rồi transaction mới commit. Khi đó cache giữ bản cũ tới hết TTL.
+
+### 5. Khoá danh sách: phiên bản thay vì xoá từng trang
+
+- Khoá phiên bản `events:list:version` chứa một GUID. Mỗi trang lưu dưới khoá `events:list:{GUID}:s={hash}:p=..:ps=..:f=..:t=..`.
+- Xoá khoá phiên bản làm mọi trang cũ hết hiệu lực ngay lập tức, mà không cần liệt kê hay xoá từng trang. Các trang cũ không còn được tra tới, tự hết hạn sau 60 giây.
+- **Vì sao GUID, không phải bộ đếm 1, 2, 3.** Nếu khoá phiên bản mất đi (hết hạn, bị xoá, Redis khởi động lại), bộ đếm có thể quay lại từ 1. Khi đó trang cũ `…:1:…` còn sót trong Redis sẽ được coi là hợp lệ. GUID ngẫu nhiên thì không lặp lại.
+- **Vì sao băm từ khoá tìm kiếm.** Từ khoá là chuỗi do người dùng nhập, có thể chứa `:` và `=`, làm lệch cấu trúc khoá. Băm SHA-256 sau khi `Trim` và `ToLowerInvariant`, cùng cách chuẩn hoá với truy vấn.
+- **Vì sao race với ghi không gây sai.** Người đọc lấy phiên bản cũ trước khi ghi, truy vấn DB trước commit, rồi lưu dưới khoá của phiên bản cũ sau khi đã xoá khoá phiên bản. Khoá đó không còn được tra tới, nên không ảnh hưởng ai. Chi tiết không có cơ chế này, xem giới hạn bên dưới.
+
+### 6. Giới hạn đã biết
+
+- **Chi tiết có thể lệch tới 60 giây khi ghi và đọc chạy đua.** Một request đọc đã lấy bản cũ từ DB trước commit, rồi lưu vào cache sau khi ta đã xoá. Chấp nhận vì TTL ngắn. Muốn triệt để thì áp dụng khoá có phiên bản như danh sách.
+- **Redis chết thì mỗi request đều chạm DB.** Đúng về dữ liệu, chỉ mất lợi ích cache. Nhưng mỗi lần ghi phải chờ `RemoveAsync` thất bại, thời gian chờ phụ thuộc timeout kết nối của StackExchange.Redis. **Chưa đo.** Xem mục 8.
+- **Redis chết thì danh sách không bao giờ hit.** Factory tạo GUID mới mỗi request, nên khoá trang không bao giờ được tra lại. Vẫn đúng, chỉ không có lợi ích.
+- **`GetValueOrDefault` trả 0 khi thiếu loại vé** trong truy vấn số vé. Hiện chỉ xảy ra khi loại vé bị xoá giữa hai truy vấn, mà chưa có chức năng xoá loại vé. Nếu xảy ra, người dùng sẽ thấy "hết vé" sai. Có thể bỏ loại vé đó khỏi kết quả, hoặc đổi thành nullable.
+- Chưa có metric tỷ lệ hit/miss, nên chưa biết cache có thật sự giảm tải không. Xem Ticket 7.
+
+### 7. Chứng minh
+
+| Test | Kiểm |
+|---|---|
+| `DistributedCacheServiceTests` (unit) | Lần hai không gọi factory; `null` không lưu; `Remove` làm lần sau đọc lại từ factory; Redis chết vẫn trả giá trị từ factory |
+| `CacheServiceTests` (integration, Redis thật) | Giá trị nằm trong Redis tới khi bị xoá |
+| `EventDetailCacheTests` | Sửa tên trong DB bằng SQL → chi tiết công khai vẫn ra tên cũ (đã cache); số vé còn luôn mới; bản nháp ẩn với người ẩn danh |
+| `ListEventsCacheTests` | Danh sách ra kết quả cũ sau khi sửa DB; hai bộ tham số khác nhau không dùng chung kết quả |
+| `EventWriteInvalidationTests` | Publish hiện ngay trong danh sách; Cancel hiện ngay trong chi tiết và danh sách; sửa loại vé hiện ngay trong chi tiết |
+
+Test "đọc cũ sau khi sửa DB" chứng minh có cache. Riêng test invalidate (`EventWriteInvalidationTests`) đã được chạy đỏ trước khi thêm xoá cache, rồi xanh sau khi thêm.
+
+### 8. Chưa đo
+
+- **Độ trễ ghi khi Redis chết** (mục 6). Cần dừng container `tickethub_redis`, gọi một lệnh ghi, đo thời gian phản hồi.
+- **Hiệu quả cache dưới tải** và chống stampede: Ticket 7 (k6).

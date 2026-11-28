@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -37,9 +39,45 @@ public sealed class ListEventsQueryValidator : AbstractValidator<ListEventsQuery
 public sealed record ListEventsQuery(string? Search, int Page, int PageSize, DateTimeOffset? From = null, DateTimeOffset? To = null)
     : IRequest<Result<PagedResult<ListEventsResponse>>>;
 
-public sealed class ListEventsQueryHandler(IReadDbContext readDbContext) : IRequestHandler<ListEventsQuery, Result<PagedResult<ListEventsResponse>>>
+public sealed class ListEventsQueryHandler(IReadDbContext readDbContext, ICacheService cache)
+    : IRequestHandler<ListEventsQuery, Result<PagedResult<ListEventsResponse>>>
 {
+    /// <summary>Khoá phiên bản: mọi trang danh sách gắn với một GUID; đổi GUID là mọi trang cũ coi như không còn.</summary>
+    internal const string VersionKey = "events:list:version";
+    internal static readonly TimeSpan VersionTtl = TimeSpan.FromDays(30);
+    internal static readonly TimeSpan ListTtl = TimeSpan.FromSeconds(60);
+
     public async Task<Result<PagedResult<ListEventsResponse>>> Handle(ListEventsQuery request, CancellationToken cancellationToken)
+    {
+        // Danh sách công khai (không có bản nháp) nên mọi người dùng chung một kết quả cho cùng tham số.
+        var version = await cache.GetOrCreateAsync(
+            VersionKey,
+            _ => Task.FromResult<string?>(Guid.NewGuid().ToString("N")),
+            VersionTtl,
+            cancellationToken) ?? throw new InvalidOperationException("Version factory always returns a value.");
+
+        var page = await cache.GetOrCreateAsync(
+            ListKey(version, request),
+            ct => LoadPageAsync(request, ct),
+            ListTtl,
+            cancellationToken);
+
+        return Result.Success(page!);
+    }
+
+    // Mỗi tham số có mặt trong khoá: đổi bất kỳ tham số nào là ra khoá khác, không lẫn kết quả.
+    internal static string ListKey(string version, ListEventsQuery request) =>
+        FormattableString.Invariant(
+            $"events:list:{version}:s={SearchHash(request.Search)}:p={request.Page}:ps={request.PageSize}:f={request.From?.ToUniversalTime():O}:t={request.To?.ToUniversalTime():O}");
+
+    // Băm từ khoá: người dùng nhập ":" hay "=" không làm lệch cấu trúc khoá.
+    private static string SearchHash(string? search)
+    {
+        var normalized = search?.Trim().ToLowerInvariant() ?? string.Empty;
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+    }
+
+    private async Task<PagedResult<ListEventsResponse>?> LoadPageAsync(ListEventsQuery request, CancellationToken cancellationToken)
     {
         var query = readDbContext.Query<Event>()
             .Where(e => e.Status != EventStatus.Draft);
