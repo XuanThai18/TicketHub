@@ -8,9 +8,21 @@ namespace TicketHub.Infrastructure.Caching;
 /// <summary>
 /// Cài đặt <see cref="ICacheService"/> trên <see cref="IDistributedCache"/> (Redis), lưu giá trị dạng JSON.
 /// Mọi lỗi của cache chỉ ghi log rồi coi như không có cache: đọc lỗi thì gọi DB, ghi lỗi thì bỏ qua.
+/// Bộ ngắt mạch: sau một lỗi Redis, trong <see cref="BreakDuration"/> mọi thao tác bỏ qua Redis, để request không phải chờ timeout mỗi lần.
 /// </summary>
-internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<DistributedCacheService> logger) : ICacheService
+internal sealed class DistributedCacheService(
+    IDistributedCache cache,
+    ILogger<DistributedCacheService> logger,
+    TimeProvider? timeProvider = null) : ICacheService
 {
+    /// <summary>Thời gian bỏ qua Redis sau một lỗi. Hết thời gian thì lần gọi kế tiếp thử Redis lại.</summary>
+    internal static readonly TimeSpan BreakDuration = TimeSpan.FromSeconds(30);
+
+    private readonly TimeProvider _clock = timeProvider ?? TimeProvider.System;
+
+    // Thời điểm (UTC ticks) bộ ngắt mạch đóng lại; 0 nghĩa là chưa từng mở.
+    private long _openUntilTicks;
+
     public async Task<T?> GetOrCreateAsync<T>(string key, Func<CancellationToken, Task<T?>> factory, TimeSpan expiration,
         CancellationToken cancellationToken)
     {
@@ -34,6 +46,11 @@ internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<D
 
     public async Task RemoveAsync(string key, CancellationToken cancellationToken)
     {
+        if (IsOpen())
+        {
+            return;
+        }
+
         try
         {
             await cache.RemoveAsync(key, cancellationToken);
@@ -42,11 +59,17 @@ internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<D
         {
             // Không xoá được thì bản cũ còn sống tới hết hạn (TTL) rồi tự mất.
             logger.LogWarning(ex, "Cache remove failed for key {CacheKey}.", key);
+            OpenBreaker();
         }
     }
 
     private async Task<byte[]?> TryGetAsync(string key, CancellationToken cancellationToken)
     {
+        if (IsOpen())
+        {
+            return null;
+        }
+
         try
         {
             return await cache.GetAsync(key, cancellationToken);
@@ -54,12 +77,18 @@ internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<D
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "Cache read failed for key {CacheKey}; reading from the database.", key);
+            OpenBreaker();
             return null;
         }
     }
 
     private async Task TrySetAsync(string key, byte[] value, TimeSpan expiration, CancellationToken cancellationToken)
     {
+        if (IsOpen())
+        {
+            return;
+        }
+
         try
         {
             await cache.SetAsync(key, value,
@@ -68,6 +97,12 @@ internal sealed class DistributedCacheService(IDistributedCache cache, ILogger<D
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "Cache write failed for key {CacheKey}.", key);
+            OpenBreaker();
         }
     }
+
+    private bool IsOpen() => _clock.GetUtcNow().UtcTicks < Volatile.Read(ref _openUntilTicks);
+
+    private void OpenBreaker() =>
+        Volatile.Write(ref _openUntilTicks, _clock.GetUtcNow().Add(BreakDuration).UtcTicks);
 }

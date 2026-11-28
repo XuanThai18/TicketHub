@@ -621,5 +621,5 @@ Test "đọc cũ sau khi sửa DB" chứng minh có cache. Riêng test invalidat
 | Sống lại | — | 20 ms |
 
 - Giảm được khoảng 6 lần ở ghi và 5–6 lần ở đọc. Chưa đạt ước lượng 0,3 và 0,6 giây: mỗi lệnh Redis chết tốn thêm thời gian ngoài `SyncTimeout`, nên đọc có ba lệnh thay vì hai.
-- Vẫn còn chậm khi Redis chết. Bộ ngắt mạch chưa làm; đó là bước tiếp theo nếu cần loại bỏ hẳn độ trễ này.
+- Bộ ngắt mạch: sau một lỗi Redis, 30 giây kế tiếp mọi thao tác bỏ qua Redis, nên chỉ lỗi đầu tiên trong mỗi cửa sổ còn chậm.
 - Test: `RedisConnectionOptionsTests` (3 test: timeout ≤ 500 ms, không abort khi khởi động, giữ đúng host và port). Toàn bộ solution 253/253 xanh.
