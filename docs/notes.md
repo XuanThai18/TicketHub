@@ -609,9 +609,9 @@ Test "đọc cũ sau khi sửa DB" chứng minh có cache. Riêng test invalidat
 - Đây không phải "chỉ mất cache" như mục 6 ban đầu nghĩ. Cần giảm timeout hoặc tắt tạm Redis khi đã lỗi.
 - Đây là một lần đo nhỏ, không phải tải. Ticket 7 (k6) sẽ đo lại dưới tải.
 
-### 10. Sau khi giảm timeout xuống 300 ms
+### 10. Đo lại timeout 300 ms, sau đó hạ xuống 100 ms
 
-`RedisConnectionOptions`: `ConnectTimeout` và `SyncTimeout` = 300 ms, `AbortOnConnectFail = false` (app vẫn khởi động khi Redis chưa lên, cache coi như miss). Đo lại cùng cách với mục 9:
+`RedisConnectionOptions`: `ConnectTimeout` và `SyncTimeout` ban đầu 300 ms (bảng dưới đo ở mức này), hiện là 100 ms (chưa đo lại lúc Redis chết), `AbortOnConnectFail = false` (app vẫn khởi động khi Redis chưa lên, cache coi như miss). Đo lại cùng cách với mục 9:
 
 | Trạng thái Redis | Ghi (PUT loại vé) | Đọc (chi tiết) |
 |---|---|---|
